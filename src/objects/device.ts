@@ -813,16 +813,23 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
   /**
    * Validate fragment state before passing to wgpu-native (which panics on some invalid configs).
    * Validates:
-   *  - At least one color target must exist
+   *  - At least one color target must exist (unless used as vertex-only with depthStencil)
    *  - Color target formats must be color formats (not depth/stencil)
    *  - Color target count ≤ maxColorAttachments
+   *  - writeMask must be valid (< 16)
    */
-  private validateFragmentState(fragment: GPUFragmentState | undefined): GPUValidationError | null {
-    if (!fragment) return null;
+  private validateFragmentState(fragment: GPUFragmentState | undefined, hasDepthStencil: boolean): GPUValidationError | null {
+    if (!fragment) {
+      if (!hasDepthStencil) {
+        return new GPUValidationError(
+          `Render pipeline must have at least one attachment (color target or depth/stencil)`
+        );
+      }
+      return null;
+    }
 
     const targets = fragment.targets ? Array.from(fragment.targets) : [];
 
-    // At least one color target (wgpu-native panics on empty targets)
     if (targets.length === 0) {
       return new GPUValidationError(
         `At least one color target state is required`
@@ -836,25 +843,73 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
       );
     }
 
-    // Validate each target's format and properties
     for (let i = 0; i < targets.length; i++) {
       const target = targets[i];
-      if (!target) continue; // null target is allowed (hole/slot)
+      if (!target) continue;
       const fmt = target.format;
-      // Check format is a color format (not depth/stencil, not compressed)
       if (GPUDeviceImpl.DEPTH_FORMATS.has(fmt) || GPUDeviceImpl.STENCIL_FORMATS.has(fmt)) {
         return new GPUValidationError(
           `Color target[${i}] format "${fmt}" is a depth/stencil format, not a color format`
         );
       }
-
-      // Validate writeMask: must be < 16 (only valid flags are 0x1|0x2|0x4|0x8 = 0xF)
-      // wgpu-native panics on invalid writeMask values (lib.rs:2313).
       if (target.writeMask !== undefined && target.writeMask >= 16) {
         return new GPUValidationError(
           `Color target[${i}] writeMask ${target.writeMask} is invalid. Valid values are 0-15 (RED|GREEN|BLUE|ALPHA)`
         );
       }
+    }
+
+    return null;
+  }
+
+  /**
+   * Validate primitive state.
+   * - stripIndexFormat is only valid for strip topologies (line-strip, triangle-strip)
+   */
+  private validatePrimitiveState(primitive: GPUPrimitiveState | undefined): GPUValidationError | null {
+    if (!primitive) return null;
+
+    if (primitive.stripIndexFormat !== undefined) {
+      const stripTopologies = new Set(["line-strip", "triangle-strip"]);
+      if (!primitive.topology || !stripTopologies.has(primitive.topology)) {
+        return new GPUValidationError(
+          `stripIndexFormat is only valid for line-strip or triangle-strip topologies, but topology is "${primitive.topology ?? "undefined"}"`
+        );
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Validate multisample state.
+   * - count must be 1 or 4
+   * - alphaToCoverageEnabled requires count === 4
+   * - alphaToCoverageEnabled conflicts with sample_mask shader output
+   */
+  private validateMultisampleState(
+    multisample: GPUMultisampleState | undefined,
+    fragmentModule?: { hasSampleMask?: boolean },
+  ): GPUValidationError | null {
+    if (!multisample) return null;
+
+    const count = multisample.count ?? 1;
+    if (count !== 1 && count !== 4) {
+      return new GPUValidationError(
+        `multisample.count must be 1 or 4, but got ${count}`
+      );
+    }
+
+    if (multisample.alphaToCoverageEnabled && count !== 4) {
+      return new GPUValidationError(
+        `alphaToCoverageEnabled requires multisample.count to be 4, but got ${count}`
+      );
+    }
+
+    if (multisample.alphaToCoverageEnabled && fragmentModule?.hasSampleMask) {
+      return new GPUValidationError(
+        `alphaToCoverageEnabled cannot be true when fragment shader outputs sample_mask`
+      );
     }
 
     return null;
@@ -1278,6 +1333,7 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
 
     // Detect frag_depth usage (requires depth/stencil state with depth aspect)
     const hasFragDepth = code.includes("frag_depth");
+    const hasSampleMask = code.includes("sample_mask");
 
     // Allocate null-terminated code string
     const codeBytes = new TextEncoder().encode(code + "\0");
@@ -1314,7 +1370,7 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     }
 
     const { GPUShaderModuleImpl } = require("./shader-module");
-    return new GPUShaderModuleImpl(moduleHandle, this._instance, descriptor.label, entryPoints, immediateDataSize, hasFragDepth, code) as unknown as GPUShaderModule;
+    return new GPUShaderModuleImpl(moduleHandle, this._instance, descriptor.label, entryPoints, immediateDataSize, hasFragDepth, code, hasSampleMask) as unknown as GPUShaderModule;
   }
 
   createComputePipeline(descriptor: GPUComputePipelineDescriptor): GPUComputePipeline {
@@ -1445,7 +1501,7 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
       if (immErr) { this.captureError(immErr); return new (require("./pipeline").GPURenderPipelineImpl)(0 as Pointer, descriptor.label) as unknown as GPURenderPipeline; }
     }
 
-    // Validate vertex buffer/attribute state before encoding (wgpu-native panics on many invalid configs)
+    // Validate vertex buffer/attribute state
     const vertexErr = this.validateVertexState(descriptor.vertex.buffers);
     if (vertexErr) {
       this.captureError(vertexErr);
@@ -1453,7 +1509,7 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
       return new GPURenderPipelineImpl(0 as Pointer, descriptor.label) as unknown as GPURenderPipeline;
     }
 
-    // Validate vertex shader inputs vs vertex buffer attributes (wgpu-native panics on mismatch)
+    // Validate vertex shader inputs vs vertex buffer attributes
     const shaderCompatErr = this.validateVertexShaderCompatibility(descriptor.vertex);
     if (shaderCompatErr) {
       this.captureError(shaderCompatErr);
@@ -1462,9 +1518,25 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     }
 
     // Validate fragment state (color target formats, count, etc.)
-    const fragStateErr = this.validateFragmentState(descriptor.fragment);
+    const fragStateErr = this.validateFragmentState(descriptor.fragment, !!descriptor.depthStencil);
     if (fragStateErr) {
       this.captureError(fragStateErr);
+      const { GPURenderPipelineImpl } = require("./pipeline");
+      return new GPURenderPipelineImpl(0 as Pointer, descriptor.label) as unknown as GPURenderPipeline;
+    }
+
+    // Validate primitive state
+    const primErr = this.validatePrimitiveState(descriptor.primitive);
+    if (primErr) {
+      this.captureError(primErr);
+      const { GPURenderPipelineImpl } = require("./pipeline");
+      return new GPURenderPipelineImpl(0 as Pointer, descriptor.label) as unknown as GPURenderPipeline;
+    }
+
+    // Validate multisample state
+    const msErr = this.validateMultisampleState(descriptor.multisample, descriptor.fragment?.module as unknown as { hasSampleMask?: boolean } | undefined);
+    if (msErr) {
+      this.captureError(msErr);
       const { GPURenderPipelineImpl } = require("./pipeline");
       return new GPURenderPipelineImpl(0 as Pointer, descriptor.label) as unknown as GPURenderPipeline;
     }
@@ -1927,8 +1999,14 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     const shaderCompatErr = this.validateVertexShaderCompatibility(descriptor.vertex);
     if (shaderCompatErr) return Promise.reject(new GPUPipelineError(shaderCompatErr.message, { reason: "validation" }));
     // Validate fragment state (color target formats, count, etc.)
-    const fragStateErr = this.validateFragmentState(descriptor.fragment);
+    const fragStateErr = this.validateFragmentState(descriptor.fragment, !!descriptor.depthStencil);
     if (fragStateErr) return Promise.reject(new GPUPipelineError(fragStateErr.message, { reason: "validation" }));
+    // Validate primitive state
+    const primErr = this.validatePrimitiveState(descriptor.primitive);
+    if (primErr) return Promise.reject(new GPUPipelineError(primErr.message, { reason: "validation" }));
+    // Validate multisample state
+    const msErr = this.validateMultisampleState(descriptor.multisample, descriptor.fragment?.module as unknown as { hasSampleMask?: boolean } | undefined);
+    if (msErr) return Promise.reject(new GPUPipelineError(msErr.message, { reason: "validation" }));
     // For render pipeline async, we use the sync version wrapped in a microtask
     // since the full async implementation would require duplicating all the
     // complex descriptor encoding. This still provides the async API contract.
