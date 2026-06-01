@@ -17,13 +17,16 @@ export class GPUShaderModuleImpl extends GPUObjectBase implements GPUShaderModul
   readonly immediateDataSize: number;
   /** Whether the shader references @builtin(frag_depth). */
   readonly hasFragDepth: boolean;
+  /** The original WGSL source code (used for vertex/fragment input validation). */
+  readonly code: string;
 
-  constructor(handle: Pointer, instance: Pointer, label?: string, entryPoints?: EntryPointInfo[], immediateDataSize = 0, hasFragDepth = false) {
+  constructor(handle: Pointer, instance: Pointer, label?: string, entryPoints?: EntryPointInfo[], immediateDataSize = 0, hasFragDepth = false, code = "") {
     super(handle, label);
     this._instance = instance;
     this.entryPoints = entryPoints ?? [];
     this.immediateDataSize = immediateDataSize;
     this.hasFragDepth = hasFragDepth;
+    this.code = code;
   }
 
   protected releaseImpl(): void {

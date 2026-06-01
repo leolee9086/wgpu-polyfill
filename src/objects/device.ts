@@ -434,9 +434,229 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     "stencil8", "depth24plus-stencil8", "depth32float-stencil8",
   ]);
 
+  /** Vertex format byte size lookup. */
+  private static VERTEX_FORMAT_SIZE: Record<string, number> = {
+    "uint8": 1, "uint8x2": 2, "uint8x4": 4,
+    "sint8": 1, "sint8x2": 2, "sint8x4": 4,
+    "unorm8": 1, "unorm8x2": 2, "unorm8x4": 4,
+    "snorm8": 1, "snorm8x2": 2, "snorm8x4": 4,
+    "uint16": 2, "uint16x2": 4, "uint16x4": 8,
+    "sint16": 2, "sint16x2": 4, "sint16x4": 8,
+    "unorm16": 2, "unorm16x2": 4, "unorm16x4": 8,
+    "snorm16": 2, "snorm16x2": 4, "snorm16x4": 8,
+    "float16": 2, "float16x2": 4, "float16x4": 8,
+    "float32": 4, "float32x2": 8, "float32x3": 12, "float32x4": 16,
+    "uint32": 4, "uint32x2": 8, "uint32x3": 12, "uint32x4": 16,
+    "sint32": 4, "sint32x2": 8, "sint32x3": 12, "sint32x4": 16,
+    "unorm10-10-10-2": 4,
+    "unorm8x4-bgra": 4,
+  };
+
   /**
-   * Validate depth/stencil state before passing to wgpu-native (which panics on mismatch).
+   * Minimum byte alignment for a vertex format's offset.
+   * For most formats this is the component byte size; packed formats use 4.
+   */
+  private static VERTEX_FORMAT_ALIGNMENT: Record<string, number> = {
+    "unorm10-10-10-2": 4,
+    "unorm8x4-bgra": 4,
+  };
+
+  /**
+   * Validate vertex buffer / attribute state before passing to wgpu-native.
+   * wgpu-native panics on many invalid configurations instead of returning an error.
    *
+   * Validates:
+   *  - buffer count ≤ maxVertexBuffers
+   *  - attribute count ≤ maxVertexAttributes
+   *  - arrayStride ≤ maxVertexBufferArrayStride
+   *  - arrayStride % 4 == 0 (unless 0)
+   *  - shaderLocation < maxVertexAttributes
+   *  - shaderLocations are unique
+   *  - attribute offset is aligned to component size
+   *  - attribute (offset + formatSize) fits within arrayStride (if stride > 0)
+   */
+  private validateVertexState(
+    buffers: Iterable<GPUVertexBufferLayout | null> | undefined,
+  ): GPUValidationError | null {
+    const maxBuffers = (this._limits as any).maxVertexBuffers ?? 8;
+    const maxAttribs = (this._limits as any).maxVertexAttributes ?? 16;
+    const maxStride = (this._limits as any).maxVertexBufferArrayStride ?? 2048;
+
+    const bufArr = buffers ? Array.from(buffers) : [];
+
+    // wgpu-native v29 does NOT support unused vertex buffer slots (holes in the array).
+    // All slots must be explicitly provided, even if empty.
+    for (let i = 0; i < bufArr.length; i++) {
+      if (!bufArr[i]) {
+        return new GPUValidationError(
+          `Vertex buffer slot ${i} is unused (null/undefined). wgpu-native does not support holes in the vertex buffer array. Use a buffer with attributes:[] instead.`
+        );
+      }
+    }
+
+    // Buffer count
+    let nonNullCount = 0;
+    for (const b of bufArr) {
+      if (b) {
+        nonNullCount++;
+        // arrayStride ≤ limit
+        if (b.arrayStride > maxStride) {
+          return new GPUValidationError(
+            `Vertex buffer arrayStride ${b.arrayStride} exceeds maxVertexBufferArrayStride (${maxStride})`
+          );
+        }
+        // arrayStride must be a multiple of 4 (unless 0)
+        if (b.arrayStride !== 0 && b.arrayStride % 4 !== 0) {
+          return new GPUValidationError(
+            `Vertex buffer arrayStride ${b.arrayStride} is not a multiple of 4`
+          );
+        }
+        // Validate attributes in this buffer
+        if (b.attributes) {
+          for (const attr of b.attributes) {
+            if (attr.shaderLocation >= maxAttribs) {
+              return new GPUValidationError(
+                `Vertex attribute shaderLocation ${attr.shaderLocation} must be < maxVertexAttributes (${maxAttribs})`
+              );
+            }
+            const formatSize = GPUDeviceImpl.VERTEX_FORMAT_SIZE[attr.format];
+            if (formatSize === undefined) {
+              return new GPUValidationError(`Unknown vertex format "${attr.format}"`);
+            }
+            const minAlign = GPUDeviceImpl.VERTEX_FORMAT_ALIGNMENT[attr.format] ?? Math.min(formatSize, 4);
+            if (attr.offset % minAlign !== 0) {
+              return new GPUValidationError(
+                `Vertex attribute offset ${attr.offset} for format "${attr.format}" must be a multiple of ${minAlign}`
+              );
+            }
+            // Attribute must fit within stride (when stride > 0)
+            if (b.arrayStride > 0 && (attr.offset + formatSize) > b.arrayStride) {
+              return new GPUValidationError(
+                `Vertex attribute format "${attr.format}" (${formatSize}B) at offset ${attr.offset} exceeds arrayStride ${b.arrayStride}`
+              );
+            }
+          }
+        }
+      }
+    }
+    if (nonNullCount > maxBuffers) {
+      return new GPUValidationError(
+        `Vertex buffer count ${nonNullCount} exceeds maxVertexBuffers (${maxBuffers})`
+      );
+    }
+
+    // shaderLocation uniqueness
+    const seenLocations = new Set<number>();
+    for (const b of bufArr) {
+      if (b?.attributes) {
+        for (const attr of b.attributes) {
+          if (seenLocations.has(attr.shaderLocation)) {
+            return new GPUValidationError(
+              `Duplicate vertex shaderLocation ${attr.shaderLocation} in vertex buffers`
+            );
+          }
+          seenLocations.add(attr.shaderLocation);
+        }
+      }
+    }
+
+    // Total attribute count
+    if (seenLocations.size > maxAttribs) {
+      return new GPUValidationError(
+        `Vertex attribute count ${seenLocations.size} exceeds maxVertexAttributes (${maxAttribs})`
+      );
+    }
+
+    return null;
+  }
+
+  /**
+   * Validate that the vertex shader inputs match the vertex buffer attributes.
+   * wgpu-native panics at lib.rs:2223 when:
+   * - vertex state is provided but the vertex shader has no vertex inputs
+   * - shader input types don't match the vertex attribute format signing
+   */
+  private validateVertexShaderCompatibility(
+    vertex: GPUVertexState,
+  ): GPUValidationError | null {
+    const vertexModule = vertex.module as unknown as { code?: string };
+    if (!vertexModule?.code) return null;
+
+    const code = vertexModule.code;
+    const buffers = vertex.buffers ? Array.from(vertex.buffers) : [];
+    const hasAttributes = buffers.some(b => b?.attributes && b.attributes.length > 0);
+    if (!hasAttributes) return null;
+
+    // Check if the vertex shader source references @location — if not, it has no vertex inputs
+    // and any vertex attributes are invalid (wgpu-core panics on this mismatch).
+    if (!code.includes("@location(")) {
+      return new GPUValidationError(
+        `Vertex shader has no vertex inputs (@location), but vertex state provides ${buffers.reduce((s, b) => s + (b?.attributes?.length ?? 0), 0)} attributes`
+      );
+    }
+
+    // Extract location → type from shader struct declarations
+    // e.g. "@location(0) input0 : vec4<f32>," → {0: "vec4<f32>"}
+    const locationTypes = new Map<number, string>();
+    const locRegex = /@location\((\d+)\)\s+\w+\s*:\s*([^,{]+)/g;
+    let match;
+    while ((match = locRegex.exec(code)) !== null) {
+      locationTypes.set(parseInt(match[1]), match[2].trim());
+    }
+
+    // Base type → WGSL base type mapping for vertex formats
+    const formatTypeInfo: Record<string, { base: string; componentCount: number }> = {
+      "uint8": { base: "u32", componentCount: 1 }, "uint8x2": { base: "u32", componentCount: 2 }, "uint8x4": { base: "u32", componentCount: 4 },
+      "sint8": { base: "i32", componentCount: 1 }, "sint8x2": { base: "i32", componentCount: 2 }, "sint8x4": { base: "i32", componentCount: 4 },
+      "unorm8": { base: "f32", componentCount: 1 }, "unorm8x2": { base: "f32", componentCount: 2 }, "unorm8x4": { base: "f32", componentCount: 4 },
+      "snorm8": { base: "f32", componentCount: 1 }, "snorm8x2": { base: "f32", componentCount: 2 }, "snorm8x4": { base: "f32", componentCount: 4 },
+      "uint16": { base: "u32", componentCount: 1 }, "uint16x2": { base: "u32", componentCount: 2 }, "uint16x4": { base: "u32", componentCount: 4 },
+      "sint16": { base: "i32", componentCount: 1 }, "sint16x2": { base: "i32", componentCount: 2 }, "sint16x4": { base: "i32", componentCount: 4 },
+      "unorm16": { base: "f32", componentCount: 1 }, "unorm16x2": { base: "f32", componentCount: 2 }, "unorm16x4": { base: "f32", componentCount: 4 },
+      "snorm16": { base: "f32", componentCount: 1 }, "snorm16x2": { base: "f32", componentCount: 2 }, "snorm16x4": { base: "f32", componentCount: 4 },
+      "float16": { base: "f32", componentCount: 1 }, "float16x2": { base: "f32", componentCount: 2 }, "float16x4": { base: "f32", componentCount: 4 },
+      "float32": { base: "f32", componentCount: 1 }, "float32x2": { base: "f32", componentCount: 2 }, "float32x3": { base: "f32", componentCount: 3 }, "float32x4": { base: "f32", componentCount: 4 },
+      "uint32": { base: "u32", componentCount: 1 }, "uint32x2": { base: "u32", componentCount: 2 }, "uint32x3": { base: "u32", componentCount: 3 }, "uint32x4": { base: "u32", componentCount: 4 },
+      "sint32": { base: "i32", componentCount: 1 }, "sint32x2": { base: "i32", componentCount: 2 }, "sint32x3": { base: "i32", componentCount: 3 }, "sint32x4": { base: "i32", componentCount: 4 },
+      "unorm10-10-10-2": { base: "f32", componentCount: 4 },
+      "unorm8x4-bgra": { base: "f32", componentCount: 4 },
+    };
+
+    // Extract the WGSL base type and component count from a shader type string
+    function getShaderTypeInfo(wgslType: string): { base: string; count: number } | null {
+      const m = /(?:vec(\d+)<)?(\w+)/.exec(wgslType);
+      if (!m) return null;
+      if (m[1]) {
+        return { base: m[2], count: parseInt(m[1]) };
+      }
+      // Scalar type (f32, u32, i32)
+      return { base: m[2], count: 1 };
+    }
+
+    for (const b of buffers) {
+      if (!b?.attributes) continue;
+      for (const attr of b.attributes) {
+        const shaderType = locationTypes.get(attr.shaderLocation);
+        if (!shaderType) continue; // Can't validate without shader type
+        const fmtInfo = formatTypeInfo[attr.format];
+        if (!fmtInfo) continue;
+
+        const shaderInfo = getShaderTypeInfo(shaderType);
+        if (!shaderInfo) continue;
+
+        // Check base type compatibility (sint→i32, uint→u32, float→f32)
+        if (shaderInfo.base !== fmtInfo.base) {
+          return new GPUValidationError(
+            `Vertex attribute at shaderLocation ${attr.shaderLocation} has format "${attr.format}" (base type ${fmtInfo.base}), but shader expects type "${shaderType}" (base type ${shaderInfo.base})`
+          );
+        }
+      }
+    }
+
+    return null;
+  }
+
+  /**
    * Per WebGPU spec:
    * - depthStencil state format must be a depth or stencil format
    * - depthCompare requires the format to have a depth aspect
@@ -1023,7 +1243,7 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     }
 
     const { GPUShaderModuleImpl } = require("./shader-module");
-    return new GPUShaderModuleImpl(moduleHandle, this._instance, descriptor.label, entryPoints, immediateDataSize, hasFragDepth) as unknown as GPUShaderModule;
+    return new GPUShaderModuleImpl(moduleHandle, this._instance, descriptor.label, entryPoints, immediateDataSize, hasFragDepth, code) as unknown as GPUShaderModule;
   }
 
   createComputePipeline(descriptor: GPUComputePipelineDescriptor): GPUComputePipeline {
@@ -1152,6 +1372,22 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     if (descriptor.fragment?.module) {
       const immErr = this.validateImmediateSize(descriptor.fragment.module, descriptor.layout);
       if (immErr) { this.captureError(immErr); return new (require("./pipeline").GPURenderPipelineImpl)(0 as Pointer, descriptor.label) as unknown as GPURenderPipeline; }
+    }
+
+    // Validate vertex buffer/attribute state before encoding (wgpu-native panics on many invalid configs)
+    const vertexErr = this.validateVertexState(descriptor.vertex.buffers);
+    if (vertexErr) {
+      this.captureError(vertexErr);
+      const { GPURenderPipelineImpl } = require("./pipeline");
+      return new GPURenderPipelineImpl(0 as Pointer, descriptor.label) as unknown as GPURenderPipeline;
+    }
+
+    // Validate vertex shader inputs vs vertex buffer attributes (wgpu-native panics on mismatch)
+    const shaderCompatErr = this.validateVertexShaderCompatibility(descriptor.vertex);
+    if (shaderCompatErr) {
+      this.captureError(shaderCompatErr);
+      const { GPURenderPipelineImpl } = require("./pipeline");
+      return new GPURenderPipelineImpl(0 as Pointer, descriptor.label) as unknown as GPURenderPipeline;
     }
 
     // Allocate entry point strings
@@ -1605,6 +1841,12 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     // Validate frag_depth usage vs depth/stencil state
     const fragDepthErr = this.validateFragDepth(descriptor);
     if (fragDepthErr) return Promise.reject(new GPUPipelineError(fragDepthErr.message, { reason: "validation" }));
+    // Validate vertex buffer/attribute state before encoding (wgpu-native panics on many invalid configs)
+    const vertexErr = this.validateVertexState(descriptor.vertex.buffers);
+    if (vertexErr) return Promise.reject(new GPUPipelineError(vertexErr.message, { reason: "validation" }));
+    // Validate vertex shader inputs vs vertex buffer attributes
+    const shaderCompatErr = this.validateVertexShaderCompatibility(descriptor.vertex);
+    if (shaderCompatErr) return Promise.reject(new GPUPipelineError(shaderCompatErr.message, { reason: "validation" }));
     // For render pipeline async, we use the sync version wrapped in a microtask
     // since the full async implementation would require duplicating all the
     // complex descriptor encoding. This still provides the async API contract.
