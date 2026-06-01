@@ -29,10 +29,10 @@ export class GPUInternalError extends Error {
   }
 }
 
-export class GPUPipelineError extends DOMException {
+export class GPUPipelineError extends Error {
   readonly reason: GPUPipelineErrorReason;
   constructor(message: string, init: GPUPipelineErrorInit) {
-    super(message, "OperationError");
+    super(message);
     this.name = "GPUPipelineError";
     this.reason = init.reason;
   }

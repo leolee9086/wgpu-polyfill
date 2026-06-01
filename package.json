@@ -1,25 +1,43 @@
 {
   "name": "wgpu-polyfill",
   "version": "0.1.0",
-  "description": "WebGPU polyfill for headless testing in Bun using wgpu-native. Enables GPU computing and rendering without a browser.",
-  "type": "module",
+  "author": {
+    "name": "wiedymi",
+    "email": "contact@wiedymi.com",
+    "url": "https://github.com/wiedymi"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wiedymi/wgpu-polyfill.git"
+  },
   "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@webgpu/types": "^0.1.52",
+    "typescript": "^5.7.2"
+  },
   "exports": {
     ".": {
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
     }
   },
+  "bugs": {
+    "url": "https://github.com/wiedymi/wgpu-polyfill/issues"
+  },
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "description": "WebGPU polyfill for headless testing in Bun using wgpu-native. Enables GPU computing and rendering without a browser.",
+  "engines": {
+    "bun": ">=1.0.0"
+  },
   "files": [
     "dist",
     "lib"
   ],
-  "scripts": {
-    "build": "bun build ./src/index.ts --outdir ./dist --target bun",
-    "test": "bun run test.ts",
-    "typecheck": "tsc --noEmit"
-  },
+  "homepage": "https://github.com/wiedymi/wgpu-polyfill#readme",
   "keywords": [
     "webgpu",
     "gpu",
@@ -33,35 +51,17 @@
     "rendering",
     "wgpu-native"
   ],
-  "author": {
-    "name": "wiedymi",
-    "email": "contact@wiedymi.com",
-    "url": "https://github.com/wiedymi"
-  },
   "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/wiedymi/wgpu-polyfill.git"
-  },
-  "bugs": {
-    "url": "https://github.com/wiedymi/wgpu-polyfill/issues"
-  },
-  "homepage": "https://github.com/wiedymi/wgpu-polyfill#readme",
-  "engines": {
-    "bun": ">=1.0.0"
-  },
   "os": [
     "darwin",
     "linux",
     "win32"
   ],
-  "cpu": [
-    "x64",
-    "arm64"
-  ],
-  "devDependencies": {
-    "@types/bun": "latest",
-    "@webgpu/types": "^0.1.52",
-    "typescript": "^5.7.2"
-  }
+  "scripts": {
+    "build": "bun build ./src/index.ts --outdir ./dist --target bun",
+    "test": "bun run test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "type": "module",
+  "types": "dist/index.d.ts"
 }

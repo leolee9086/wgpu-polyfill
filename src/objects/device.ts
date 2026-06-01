@@ -304,21 +304,168 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
   }
 
   /**
-   * Validates a shader entry point name.
+   * Validates a shader entry point name against WGSL rules and the shader module.
    * Per WebGPU spec:
    * - If undefined/null, it's valid (defaults to the only entry point)
+   * - If undefined but the shader has multiple entry points for this stage → error
    * - If provided, must not be empty
    * - Must not contain U+0000 (null character)
+   * - Must match an entry point in the shader module for the given stage
    */
-  private validateEntryPoint(entryPoint?: string | null): GPUValidationError | null {
-    if (entryPoint === undefined || entryPoint === null) return null;
+  private validateEntryPoint(
+    entryPoint: string | undefined | null,
+    shaderModule?: GPUShaderModule,
+    stage?: "vertex" | "fragment" | "compute"
+  ): GPUValidationError | null {
+    if (entryPoint === undefined || entryPoint === null) {
+      // Undefined entry point — must default to the only entry point for this stage
+      if (shaderModule && stage) {
+        const mod = shaderModule as unknown as { entryPoints?: Array<{ name: string; stage: string }> };
+        if (mod.entryPoints && mod.entryPoints.length > 0) {
+          const stageEntries = mod.entryPoints.filter(e => e.stage === stage);
+          // No entry point for this stage, but shader has entry points for other stages → error
+          if (stageEntries.length === 0) {
+            return new GPUValidationError(
+              `Shader module has no entry point for stage "${stage}"`
+            );
+          }
+          // Multiple entry points for this stage with no explicit choice → ambiguous, error
+          if (stageEntries.length > 1) {
+            return new GPUValidationError(
+              `Multiple entry points for stage "${stage}", but no entry point specified`
+            );
+          }
+        }
+      }
+      return null;
+    }
     if (entryPoint === "") {
       return new GPUValidationError("Entry point must not be empty");
     }
     if (entryPoint.includes("\0")) {
       return new GPUValidationError(`Entry point must not contain null character (U+0000)`);
     }
+    // Check against shader module entry points
+    if (shaderModule && stage) {
+      const mod = shaderModule as unknown as { entryPoints?: Array<{ name: string; stage: string }> };
+      if (mod.entryPoints && mod.entryPoints.length > 0) {
+        const exists = mod.entryPoints.some(e => e.name === entryPoint && e.stage === stage);
+        if (!exists) {
+          return new GPUValidationError(
+            `Entry point "${entryPoint}" not found in shader module for stage "${stage}"`
+          );
+        }
+      }
+    }
     return null;
+  }
+
+  /**
+   * Parse entry point names from WGSL source code.
+   * Uses a proper scanner (not regex) to handle comments and strings.
+   *
+   * WGSL entry point syntax:
+   *   @vertex fn name(...) { ... }
+   *   @fragment fn name(...) { ... }
+   *   @compute fn name(...) { ... }
+   *
+   * Multiple attributes may precede fn (e.g. @compute @workgroup_size(1)).
+   */
+  private parseWGSLShaderEntryPoints(wgsl: string): Array<{ name: string; stage: string }> {
+    const entries: Array<{ name: string; stage: string }> = [];
+    const len = wgsl.length;
+
+    // Scan helpers
+    const isIdentStart = (c: string) => /[a-zA-Z_]/.test(c) || (c.codePointAt(0) ?? 0) > 0x7f;
+    const isIdentCont = (c: string) => isIdentStart(c) || /[0-9]/.test(c);
+    const isSpace = (c: string) => c === ' ' || c === '\t' || c === '\n' || c === '\r';
+
+    let i = 0;
+    let pendingAttr: string | null = null;
+
+    const next = () => {
+      if (i < len) {
+        const c = wgsl[i];
+        i++;
+        return c;
+      }
+      return '';
+    };
+    const peek = (n = 0) => (i + n < len ? wgsl[i + n] : '');
+    const skipSpace = () => { while (i < len && isSpace(wgsl[i])) i++; };
+
+    while (i < len) {
+      const c = wgsl[i];
+
+      // Line comment: //
+      if (c === '/' && peek(1) === '/') {
+        while (i < len && wgsl[i] !== '\n') i++;
+        continue;
+      }
+
+      // Block comment: /* ... */
+      if (c === '/' && peek(1) === '*') {
+        i += 2;
+        while (i < len - 1 && !(wgsl[i] === '*' && peek(1) === '/')) i++;
+        i += 2; // skip */
+        continue;
+      }
+
+      // Skip string literals (WGSL has no string literals in the traditional
+      // sense, but shader might have attribute strings or similar)
+      if (c === '"' || c === "'") {
+        const quote = c;
+        i++;
+        while (i < len && wgsl[i] !== quote) {
+          if (wgsl[i] === '\\') i++; // skip escape
+          i++;
+        }
+        if (i < len) i++; // skip closing quote
+        continue;
+      }
+
+      // Attribute: @identifier
+      // Only track vertex/fragment/compute attributes; skip others
+      if (c === '@') {
+        i++;
+        let attr = '';
+        while (i < len && isIdentCont(wgsl[i])) {
+          attr += wgsl[i];
+          i++;
+        }
+        if (attr === 'vertex' || attr === 'fragment' || attr === 'compute') {
+          pendingAttr = attr;
+        }
+        continue;
+      }
+
+      // fn keyword
+      if (c === 'f' && peek(1) === 'n' && !isIdentCont(peek(2))) {
+        i += 2; // skip 'fn'
+        skipSpace();
+        // Read identifier (function name)
+        let name = '';
+        if (i < len && isIdentStart(wgsl[i])) {
+          while (i < len && isIdentCont(wgsl[i])) {
+            name += wgsl[i];
+            i++;
+          }
+        }
+        // If we had a stage attribute, record the entry point
+        if (name && pendingAttr && (pendingAttr === 'vertex' || pendingAttr === 'fragment' || pendingAttr === 'compute')) {
+          if (!entries.some(e => e.name === name && e.stage === pendingAttr)) {
+            entries.push({ name, stage: pendingAttr });
+          }
+        }
+        pendingAttr = null;
+        continue;
+      }
+
+      // Any other character — consume and move on
+      i++;
+    }
+
+    return entries;
   }
 
   createTexture(descriptor: GPUTextureDescriptor): GPUTexture {
@@ -726,6 +873,9 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
       throw new GPUValidationError("Shader code cannot be empty");
     }
 
+    // Parse entry points from WGSL source for validation
+    const entryPoints = this.parseWGSLShaderEntryPoints(code);
+
     // Allocate null-terminated code string
     const codeBytes = new TextEncoder().encode(code + "\0");
     shaderBuffers.push(codeBytes);
@@ -761,7 +911,7 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     }
 
     const { GPUShaderModuleImpl } = require("./shader-module");
-    return new GPUShaderModuleImpl(moduleHandle, this._instance, descriptor.label) as unknown as GPUShaderModule;
+    return new GPUShaderModuleImpl(moduleHandle, this._instance, descriptor.label, entryPoints) as unknown as GPUShaderModule;
   }
 
   createComputePipeline(descriptor: GPUComputePipelineDescriptor): GPUComputePipeline {
@@ -773,7 +923,8 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
 
     // Validate entry point before calling native
     const entryPoint = descriptor.compute.entryPoint;
-    const entryPointError = this.validateEntryPoint(entryPoint);
+    const shaderModule = descriptor.compute.module;
+    const entryPointError = this.validateEntryPoint(entryPoint, shaderModule, "compute");
     if (entryPointError) {
       this.captureError(entryPointError);
       const { GPUComputePipelineImpl } = require("./pipeline");
@@ -826,7 +977,7 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
   }
 
   createComputePipelineAsync(descriptor: GPUComputePipelineDescriptor): Promise<GPUComputePipeline> {
-    const entryPointError = this.validateEntryPoint(descriptor.compute.entryPoint);
+    const entryPointError = this.validateEntryPoint(descriptor.compute.entryPoint, descriptor.compute.module, "compute");
     if (entryPointError) return Promise.reject(new GPUPipelineError(entryPointError.message, { reason: "validation" }));
     // wgpu-native async pipeline creation is not fully implemented,
     // so we use the sync version wrapped in a microtask to provide
@@ -856,13 +1007,15 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
       : ((descriptor.layout as unknown as { handle: Pointer })?.handle as unknown as number) ?? 0;
 
     // Validate entry points before calling native
-    const vertexEntryPointError = this.validateEntryPoint(descriptor.vertex.entryPoint);
+    const vertexEntryPointError = this.validateEntryPoint(descriptor.vertex.entryPoint, descriptor.vertex.module, "vertex");
     if (vertexEntryPointError) {
       this.captureError(vertexEntryPointError);
       const { GPURenderPipelineImpl } = require("./pipeline");
       return new GPURenderPipelineImpl(0 as Pointer, descriptor.label) as unknown as GPURenderPipeline;
     }
-    const fragmentEntryPointError = descriptor.fragment ? this.validateEntryPoint(descriptor.fragment.entryPoint) : null;
+    const fragmentEntryPointError = descriptor.fragment
+      ? this.validateEntryPoint(descriptor.fragment.entryPoint, descriptor.fragment.module, "fragment")
+      : null;
     if (fragmentEntryPointError) {
       this.captureError(fragmentEntryPointError);
       const { GPURenderPipelineImpl } = require("./pipeline");
@@ -1279,9 +1432,11 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
   }
 
   createRenderPipelineAsync(descriptor: GPURenderPipelineDescriptor): Promise<GPURenderPipeline> {
-    const vertexEntryPointError = this.validateEntryPoint(descriptor.vertex.entryPoint);
+    const vertexEntryPointError = this.validateEntryPoint(descriptor.vertex.entryPoint, descriptor.vertex.module, "vertex");
     if (vertexEntryPointError) return Promise.reject(new GPUPipelineError(vertexEntryPointError.message, { reason: "validation" }));
-    const fragmentEntryPointError = descriptor.fragment ? this.validateEntryPoint(descriptor.fragment.entryPoint) : null;
+    const fragmentEntryPointError = descriptor.fragment
+      ? this.validateEntryPoint(descriptor.fragment.entryPoint, descriptor.fragment.module, "fragment")
+      : null;
     if (fragmentEntryPointError) return Promise.reject(new GPUPipelineError(fragmentEntryPointError.message, { reason: "validation" }));
     // For render pipeline async, we use the sync version wrapped in a microtask
     // since the full async implementation would require duplicating all the
