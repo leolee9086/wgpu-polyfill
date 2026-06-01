@@ -43,6 +43,6 @@
 
     "web-streams-polyfill": ["web-streams-polyfill@3.3.3", "", {}, "sha512-d2JWLCivmZYTSIoge9MsgFCZrt571BikcWGYkjC1khllbTeDlGqZ2D8vD8E/lJa8WGWbb7Plm8/XJYV7IJHZZw=="],
 
-    "wgsl-module-loader": ["wgsl-module-loader@github:leolee9086/my-wgsl-loader#ffb47db", { "dependencies": { "magic-string": "^0.30.10", "node-fetch": "^3.3.2" } }, "leolee9086-my-wgsl-loader-ffb47db", "sha512-iY9l6fdaMZtwqXC54sKWVvaY5bV2b/W8PLbyDszj44IxjlUdvKt6uIqLJeb/BjYQqDEqh3kQ80oQht8R8SqRxQ=="],
+    "wgsl-module-loader": ["wgsl-module-loader@github:leolee9086/my-wgsl-loader#faf049d", { "dependencies": { "magic-string": "^0.30.10", "node-fetch": "^3.3.2" } }, "leolee9086-my-wgsl-loader-faf049d", "sha512-Hd6oggAD8O6kAkXW3hbtU/ELqiFAyK00FX85RVTyXizUitBhRlE+usrSYNkpGUaZFGWpk79eklksBapMqR/QHA=="],
   }
 }
