@@ -303,6 +303,24 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     return null;
   }
 
+  /**
+   * Validates a shader entry point name.
+   * Per WebGPU spec:
+   * - If undefined/null, it's valid (defaults to the only entry point)
+   * - If provided, must not be empty
+   * - Must not contain U+0000 (null character)
+   */
+  private validateEntryPoint(entryPoint?: string | null): GPUValidationError | null {
+    if (entryPoint === undefined || entryPoint === null) return null;
+    if (entryPoint === "") {
+      return new GPUValidationError("Entry point must not be empty");
+    }
+    if (entryPoint.includes("\0")) {
+      return new GPUValidationError(`Entry point must not contain null character (U+0000)`);
+    }
+    return null;
+  }
+
   createTexture(descriptor: GPUTextureDescriptor): GPUTexture {
     // Heuristic: estimated bytes per pixel by format
     const formatByteSizes: Record<string, number> = {
@@ -753,10 +771,19 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
       ? 0
       : ((descriptor.layout as unknown as { handle: Pointer })?.handle as unknown as number) ?? 0;
 
+    // Validate entry point before calling native
+    const entryPoint = descriptor.compute.entryPoint;
+    const entryPointError = this.validateEntryPoint(entryPoint);
+    if (entryPointError) {
+      this.captureError(entryPointError);
+      const { GPUComputePipelineImpl } = require("./pipeline");
+      return new GPUComputePipelineImpl(0 as Pointer, descriptor.label) as unknown as GPUComputePipeline;
+    }
+
     // Allocate entry point string (null-terminated)
     let entryPointPtr = 0;
-    if (descriptor.compute.entryPoint) {
-      const entryPointBytes = new TextEncoder().encode(descriptor.compute.entryPoint + "\0");
+    if (entryPoint) {
+      const entryPointBytes = new TextEncoder().encode(entryPoint + "\0");
       pipelineBuffers.push(entryPointBytes);
       entryPointPtr = ptr(entryPointBytes) as unknown as number;
     }
@@ -799,6 +826,8 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
   }
 
   createComputePipelineAsync(descriptor: GPUComputePipelineDescriptor): Promise<GPUComputePipeline> {
+    const entryPointError = this.validateEntryPoint(descriptor.compute.entryPoint);
+    if (entryPointError) return Promise.reject(new GPUPipelineError(entryPointError.message, { reason: "validation" }));
     // wgpu-native async pipeline creation is not fully implemented,
     // so we use the sync version wrapped in a microtask to provide
     // the async API contract.
@@ -825,6 +854,20 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     const layoutHandle = descriptor.layout === "auto"
       ? 0
       : ((descriptor.layout as unknown as { handle: Pointer })?.handle as unknown as number) ?? 0;
+
+    // Validate entry points before calling native
+    const vertexEntryPointError = this.validateEntryPoint(descriptor.vertex.entryPoint);
+    if (vertexEntryPointError) {
+      this.captureError(vertexEntryPointError);
+      const { GPURenderPipelineImpl } = require("./pipeline");
+      return new GPURenderPipelineImpl(0 as Pointer, descriptor.label) as unknown as GPURenderPipeline;
+    }
+    const fragmentEntryPointError = descriptor.fragment ? this.validateEntryPoint(descriptor.fragment.entryPoint) : null;
+    if (fragmentEntryPointError) {
+      this.captureError(fragmentEntryPointError);
+      const { GPURenderPipelineImpl } = require("./pipeline");
+      return new GPURenderPipelineImpl(0 as Pointer, descriptor.label) as unknown as GPURenderPipeline;
+    }
 
     // Allocate entry point strings
     let vertexEntryPointPtr = 0;
@@ -1236,6 +1279,10 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
   }
 
   createRenderPipelineAsync(descriptor: GPURenderPipelineDescriptor): Promise<GPURenderPipeline> {
+    const vertexEntryPointError = this.validateEntryPoint(descriptor.vertex.entryPoint);
+    if (vertexEntryPointError) return Promise.reject(new GPUPipelineError(vertexEntryPointError.message, { reason: "validation" }));
+    const fragmentEntryPointError = descriptor.fragment ? this.validateEntryPoint(descriptor.fragment.entryPoint) : null;
+    if (fragmentEntryPointError) return Promise.reject(new GPUPipelineError(fragmentEntryPointError.message, { reason: "validation" }));
     // For render pipeline async, we use the sync version wrapped in a microtask
     // since the full async implementation would require duplicating all the
     // complex descriptor encoding. This still provides the async API contract.

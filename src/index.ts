@@ -29,10 +29,20 @@ export class GPUInternalError extends Error {
   }
 }
 
+export class GPUPipelineError extends DOMException {
+  readonly reason: GPUPipelineErrorReason;
+  constructor(message: string, init: GPUPipelineErrorInit) {
+    super(message, "OperationError");
+    this.name = "GPUPipelineError";
+    this.reason = init.reason;
+  }
+}
+
 // Register as globals for CTS compatibility
 (globalThis as any).GPUValidationError = GPUValidationError;
 (globalThis as any).GPUOutOfMemoryError = GPUOutOfMemoryError;
 (globalThis as any).GPUInternalError = GPUInternalError;
+(globalThis as any).GPUPipelineError = GPUPipelineError;
 
 // Re-export types for convenience
 export type { Pointer } from "./ffi/types";

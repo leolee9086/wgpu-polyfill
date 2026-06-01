@@ -49,7 +49,10 @@ export abstract class GPUObjectBase {
   release(): void {
     if (this._released) return;
     this._released = true;
-    this.releaseImpl();
+    // Skip null/zero handles (error placeholder objects)
+    if (this._handle) {
+      this.releaseImpl();
+    }
   }
 
   /**

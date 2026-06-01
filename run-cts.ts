@@ -33,6 +33,9 @@ const globals: Record<string, any> = {
   GPURenderBundleEncoder: GPURenderBundleEncoderImpl,
   GPUTextureView: GPUTextureViewImpl,
   GPUBufferUsage, GPUTextureUsage, GPUMapMode,
+  // CTS expects these as constructable globals
+  GPUSupportedLimits: class GPUSupportedLimits {},
+  GPUSupportedFeatures: class GPUSupportedFeatures {},
 };
 for (const [name, val] of Object.entries(globals)) {
   (globalThis as any)[name] = val;
