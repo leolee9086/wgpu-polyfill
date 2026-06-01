@@ -650,6 +650,27 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
             `Vertex attribute at shaderLocation ${attr.shaderLocation} has format "${attr.format}" (base type ${fmtInfo.base}), but shader expects type "${shaderType}" (base type ${shaderInfo.base})`
           );
         }
+
+        // Packed vertex formats (unorm10-10-10-2, unorm8x4-bgra) with stride=0 cause
+        // wgpu-native panic at lib.rs:2223 when the shader type component count doesn't
+        // exactly match the format's packed component count. Reject mismatched counts
+        // only for these packed formats (regular formats allow mismatched counts per spec).
+        const packedFormats = new Set(["unorm10-10-10-2", "unorm8x4-bgra"]);
+        if (packedFormats.has(attr.format)) {
+          // Packed formats require exact component count match
+          if (shaderInfo.count !== fmtInfo.componentCount) {
+            return new GPUValidationError(
+              `Packed vertex format "${attr.format}" (${fmtInfo.componentCount} components) requires shader type with exactly ${fmtInfo.componentCount} components, but shader expects "${shaderType}" (${shaderInfo.count} components)`
+            );
+          }
+          // Packed formats require arrayStride to match format size when stride > 0
+          // when stride is 0 wgpu-native may panic
+          if ((b as GPUVertexBufferLayout).arrayStride === 0) {
+            return new GPUValidationError(
+              `Packed vertex format "${attr.format}" requires non-zero arrayStride, but stride is 0`
+            );
+          }
+        }
       }
     }
 
@@ -786,6 +807,56 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
         `Fragment shader writes frag_depth, but format "${ds.format}" has no depth aspect`
       );
     }
+    return null;
+  }
+
+  /**
+   * Validate fragment state before passing to wgpu-native (which panics on some invalid configs).
+   * Validates:
+   *  - At least one color target must exist
+   *  - Color target formats must be color formats (not depth/stencil)
+   *  - Color target count ≤ maxColorAttachments
+   */
+  private validateFragmentState(fragment: GPUFragmentState | undefined): GPUValidationError | null {
+    if (!fragment) return null;
+
+    const targets = fragment.targets ? Array.from(fragment.targets) : [];
+
+    // At least one color target (wgpu-native panics on empty targets)
+    if (targets.length === 0) {
+      return new GPUValidationError(
+        `At least one color target state is required`
+      );
+    }
+
+    const maxColorAttachments = (this._limits as any).maxColorAttachments ?? 8;
+    if (targets.length > maxColorAttachments) {
+      return new GPUValidationError(
+        `Color target count ${targets.length} exceeds maxColorAttachments (${maxColorAttachments})`
+      );
+    }
+
+    // Validate each target's format and properties
+    for (let i = 0; i < targets.length; i++) {
+      const target = targets[i];
+      if (!target) continue; // null target is allowed (hole/slot)
+      const fmt = target.format;
+      // Check format is a color format (not depth/stencil, not compressed)
+      if (GPUDeviceImpl.DEPTH_FORMATS.has(fmt) || GPUDeviceImpl.STENCIL_FORMATS.has(fmt)) {
+        return new GPUValidationError(
+          `Color target[${i}] format "${fmt}" is a depth/stencil format, not a color format`
+        );
+      }
+
+      // Validate writeMask: must be < 16 (only valid flags are 0x1|0x2|0x4|0x8 = 0xF)
+      // wgpu-native panics on invalid writeMask values (lib.rs:2313).
+      if (target.writeMask !== undefined && target.writeMask >= 16) {
+        return new GPUValidationError(
+          `Color target[${i}] writeMask ${target.writeMask} is invalid. Valid values are 0-15 (RED|GREEN|BLUE|ALPHA)`
+        );
+      }
+    }
+
     return null;
   }
 
@@ -1390,6 +1461,14 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
       return new GPURenderPipelineImpl(0 as Pointer, descriptor.label) as unknown as GPURenderPipeline;
     }
 
+    // Validate fragment state (color target formats, count, etc.)
+    const fragStateErr = this.validateFragmentState(descriptor.fragment);
+    if (fragStateErr) {
+      this.captureError(fragStateErr);
+      const { GPURenderPipelineImpl } = require("./pipeline");
+      return new GPURenderPipelineImpl(0 as Pointer, descriptor.label) as unknown as GPURenderPipeline;
+    }
+
     // Allocate entry point strings
     let vertexEntryPointPtr = 0;
     if (descriptor.vertex.entryPoint) {
@@ -1847,6 +1926,9 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     // Validate vertex shader inputs vs vertex buffer attributes
     const shaderCompatErr = this.validateVertexShaderCompatibility(descriptor.vertex);
     if (shaderCompatErr) return Promise.reject(new GPUPipelineError(shaderCompatErr.message, { reason: "validation" }));
+    // Validate fragment state (color target formats, count, etc.)
+    const fragStateErr = this.validateFragmentState(descriptor.fragment);
+    if (fragStateErr) return Promise.reject(new GPUPipelineError(fragStateErr.message, { reason: "validation" }));
     // For render pipeline async, we use the sync version wrapped in a microtask
     // since the full async implementation would require duplicating all the
     // complex descriptor encoding. This still provides the async API contract.
