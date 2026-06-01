@@ -448,6 +448,34 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
       );
     }
 
+    // depth format with depth enabled or stencil ops requires depthCompare
+    if (isDepthFormat && (ds.depthWriteEnabled || !this.isDefaultStencilState(ds))) {
+      if (ds.depthCompare === undefined) {
+        return new GPUValidationError(
+          `depthCompare must be specified when depth is enabled for format "${ds.format}"`
+        );
+      }
+    }
+
+    // Stencil operations require a stencil format
+    if (!isStencilFormat) {
+      const hasStencilOp = (
+        (ds.stencilFront?.failOp !== undefined && ds.stencilFront.failOp !== "keep") ||
+        (ds.stencilFront?.depthFailOp !== undefined && ds.stencilFront.depthFailOp !== "keep") ||
+        (ds.stencilFront?.passOp !== undefined && ds.stencilFront.passOp !== "keep") ||
+        (ds.stencilBack?.failOp !== undefined && ds.stencilBack.failOp !== "keep") ||
+        (ds.stencilBack?.depthFailOp !== undefined && ds.stencilBack.depthFailOp !== "keep") ||
+        (ds.stencilBack?.passOp !== undefined && ds.stencilBack.passOp !== "keep") ||
+        (ds.stencilReadMask !== undefined && ds.stencilReadMask !== 0xFFFFFFFF) ||
+        (ds.stencilWriteMask !== undefined && ds.stencilWriteMask !== 0xFFFFFFFF)
+      );
+      if (hasStencilOp) {
+        return new GPUValidationError(
+          `Stencil operations require a stencil format, but format is "${ds.format}"`
+        );
+      }
+    }
+
     // depthWriteEnabled requires a depth format
     if (ds.depthWriteEnabled && !isDepthFormat) {
       return new GPUValidationError(
@@ -490,6 +518,19 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     }
 
     return null;
+  }
+
+  private isDefaultStencilState(ds: GPUDepthStencilState): boolean {
+    return (
+      (ds.stencilFront?.failOp === undefined || ds.stencilFront.failOp === "keep") &&
+      (ds.stencilFront?.depthFailOp === undefined || ds.stencilFront.depthFailOp === "keep") &&
+      (ds.stencilFront?.passOp === undefined || ds.stencilFront.passOp === "keep") &&
+      (ds.stencilBack?.failOp === undefined || ds.stencilBack.failOp === "keep") &&
+      (ds.stencilBack?.depthFailOp === undefined || ds.stencilBack.depthFailOp === "keep") &&
+      (ds.stencilBack?.passOp === undefined || ds.stencilBack.passOp === "keep") &&
+      (ds.stencilReadMask === undefined || ds.stencilReadMask === 0xFFFFFFFF) &&
+      (ds.stencilWriteMask === undefined || ds.stencilWriteMask === 0xFFFFFFFF)
+    );
   }
 
   createTexture(descriptor: GPUTextureDescriptor): GPUTexture {
