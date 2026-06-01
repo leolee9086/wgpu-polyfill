@@ -4,7 +4,7 @@
  * Low-level scanning primitives come from my-wgsl-loader's utils.
  */
 
-import { utils } from "../../../my-wgsl-loader/src/parser.js";
+import { utils } from "wgsl-module-loader/parser";
 
 export interface EntryPointInfo {
   name: string;

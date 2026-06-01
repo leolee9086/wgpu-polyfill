@@ -65,6 +65,6 @@
   "type": "module",
   "types": "dist/index.d.ts",
   "dependencies": {
-    "wgsl-module-loader": "file:../my-wgsl-loader"
+    "wgsl-module-loader": "github:leolee9086/my-wgsl-loader"
   }
 }
