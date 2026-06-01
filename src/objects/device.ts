@@ -28,24 +28,46 @@ import { pollUntilComplete } from "../async/polling";
 const shaderBuffers: Uint8Array[] = [];
 const pipelineBuffers: Uint8Array[] = [];
 
-// WGPUFeatureName to GPUFeatureName mapping
+// WGPUFeatureName to GPUFeatureName mapping (v29 enum values)
 const FEATURE_NAME_MAP: Record<number, GPUFeatureName> = {
-  0x01: "depth-clip-control",
-  0x02: "depth32float-stencil8",
-  0x03: "timestamp-query",
+  0x01: "core-features-and-limits",
+  0x02: "depth-clip-control",
+  0x03: "depth32float-stencil8",
   0x04: "texture-compression-bc",
   0x05: "texture-compression-bc-sliced-3d",
   0x06: "texture-compression-etc2",
   0x07: "texture-compression-astc",
-  0x08: "indirect-first-instance",
-  0x09: "shader-f16",
-  0x0A: "rg11b10ufloat-renderable",
-  0x0B: "bgra8unorm-storage",
-  0x0C: "float32-filterable",
-  0x0D: "float32-blendable",
-  0x0E: "clip-distances",
-  0x0F: "dual-source-blending",
+  0x08: "texture-compression-astc-sliced-3d",
+  0x09: "timestamp-query",
+  0x0A: "indirect-first-instance",
+  0x0B: "shader-f16",
+  0x0C: "rg11b10ufloat-renderable",
+  0x0D: "bgra8unorm-storage",
+  0x0E: "float32-filterable",
+  0x0F: "float32-blendable",
+  0x10: "clip-distances",
+  0x11: "dual-source-blending",
+  0x12: "subgroups",
+  0x13: "texture-formats-tier-1",
+  0x14: "texture-formats-tier-2",
+  0x15: "primitive-index",
+  0x16: "texture-component-swizzle",
 };
+
+// Reverse map: GPUFeatureName → native feature ID
+const FEATURE_NAME_TO_ID: Record<string, number> = {};
+for (const [id, name] of Object.entries(FEATURE_NAME_MAP)) {
+  FEATURE_NAME_TO_ID[name] = Number(id);
+}
+
+// Native extension features (WGPUNativeFeature) mapped to GPUFeatureName
+const NATIVE_FEATURE_MAP: Record<number, GPUFeatureName> = {
+  0x00030001: "immediate-data",
+};
+const NATIVE_FEATURE_NAME_TO_ID: Record<string, number> = {};
+for (const [id, name] of Object.entries(NATIVE_FEATURE_MAP)) {
+  NATIVE_FEATURE_NAME_TO_ID[name] = Number(id);
+}
 
 type EventListenerEntry = {
   listener: EventListenerOrEventListenerObject;
@@ -95,8 +117,8 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
   }
 
   private queryLimits(): GPUSupportedLimits {
-    // WGPULimits struct layout (152 bytes)
-    const limitsBuffer = new Uint8Array(152);
+    // WGPULimits struct layout (v29: 160 bytes with maxImmediateSize)
+    const limitsBuffer = new Uint8Array(160);
     const limitsView = new DataView(limitsBuffer.buffer);
     limitsView.setBigUint64(0, BigInt(0), true); // nextInChain = null
 
@@ -139,6 +161,14 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
       maxComputeWorkgroupSizeY: limitsView.getUint32(136, true),
       maxComputeWorkgroupSizeZ: limitsView.getUint32(140, true),
       maxComputeWorkgroupsPerDimension: limitsView.getUint32(144, true),
+      maxImmediateSize: (() => {
+        const v = limitsView.getUint32(148, true);
+        // If undefined or 0 but feature is enabled, provide a reasonable default
+        if ((v === 0xFFFFFFFF || v === 0) && this._features?.has?.('immediate-data')) {
+          return 256;
+        }
+        return v;
+      })(),
     } as GPUSupportedLimits;
   }
 
@@ -147,6 +177,13 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
 
     // Check each feature individually using wgpuDeviceHasFeature
     for (const [featureId, featureName] of Object.entries(FEATURE_NAME_MAP)) {
+      const hasFeature = getLib().wgpuDeviceHasFeature(this._handle, Number(featureId));
+      if (hasFeature === 1) {
+        features.add(featureName as GPUFeatureName);
+      }
+    }
+    // Check native extension features
+    for (const [featureId, featureName] of Object.entries(NATIVE_FEATURE_MAP)) {
       const hasFeature = getLib().wgpuDeviceHasFeature(this._handle, Number(featureId));
       if (hasFeature === 1) {
         features.add(featureName as GPUFeatureName);
@@ -855,6 +892,7 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
       label: { data: labelStr.data, length: labelStr.length },
       bindGroupLayoutCount: layouts.length,
       bindGroupLayouts: layoutsPtrValue,
+      immediateSize: (descriptor as any).immediateSize ?? 0,
     }).ptr;
 
     const pipelineLayoutHandle = getLib().wgpuDeviceCreatePipelineLayout(this._handle, descPtr);
@@ -1713,6 +1751,7 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
       maxComputeWorkgroupSizeY: 256,
       maxComputeWorkgroupSizeZ: 64,
       maxComputeWorkgroupsPerDimension: 65535,
+      maxImmediateSize: 256,
     } as GPUSupportedLimits;
   }
 }

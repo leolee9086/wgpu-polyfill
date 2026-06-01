@@ -82,10 +82,11 @@ export const WGPUBindGroupDescriptor = defineStruct("WGPUBindGroupDescriptor", [
   { name: "entries", type: "ptr" },
 ]);
 
-// WGPUPipelineLayoutDescriptor
+// WGPUPipelineLayoutDescriptor (v29 adds immediateSize at end)
 export const WGPUPipelineLayoutDescriptor = defineStruct("WGPUPipelineLayoutDescriptor", [
   { name: "nextInChain", type: "ptr" },
   { name: "label", type: { struct: WGPUStringView } },
   { name: "bindGroupLayoutCount", type: "usize" },
   { name: "bindGroupLayouts", type: "ptr" },
+  { name: "immediateSize", type: "u32" },
 ]);

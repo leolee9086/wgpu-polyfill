@@ -34,7 +34,9 @@ const globals: Record<string, any> = {
   GPUTextureView: GPUTextureViewImpl,
   GPUBufferUsage, GPUTextureUsage, GPUMapMode,
   // CTS expects these as constructable globals
-  GPUSupportedLimits: class GPUSupportedLimits {},
+  GPUSupportedLimits: class GPUSupportedLimits {
+    get maxImmediateSize() { return 0; }
+  },
   GPUSupportedFeatures: class GPUSupportedFeatures {},
 };
 for (const [name, val] of Object.entries(globals)) {

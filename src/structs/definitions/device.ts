@@ -34,7 +34,7 @@ export const WGPUDeviceDescriptor = defineStruct("WGPUDeviceDescriptor", [
   { name: "uncapturedErrorCallbackInfo", type: { struct: WGPUUncapturedErrorCallbackInfo } },
 ]);
 
-// WGPULimits - all the device limits
+// WGPULimits - all the device limits (v29 adds maxImmediateSize)
 export const WGPULimits = defineStruct("WGPULimits", [
   { name: "nextInChain", type: "ptr" },
   { name: "maxTextureDimension1D", type: "u32" },
@@ -68,6 +68,7 @@ export const WGPULimits = defineStruct("WGPULimits", [
   { name: "maxComputeWorkgroupSizeY", type: "u32" },
   { name: "maxComputeWorkgroupSizeZ", type: "u32" },
   { name: "maxComputeWorkgroupsPerDimension", type: "u32" },
+  { name: "maxImmediateSize", type: "u32" },
 ]);
 
 // WGPUAdapterInfo

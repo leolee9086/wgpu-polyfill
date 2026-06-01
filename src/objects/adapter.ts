@@ -8,27 +8,50 @@ import { getLib, type Pointer } from "../ffi";
 import { StructEncoder } from "../structs/encoder";
 import { getCallbackRegistry, createHandle } from "../async/callback-registry";
 import { pollUntilComplete } from "../async/polling";
-import { WGPUDeviceDescriptor } from "../structs/definitions/device";
+import { WGPUDeviceDescriptor, WGPULimits } from "../structs/definitions/device";
 import { ptr, JSCallback } from "bun:ffi";
 
-// WGPUFeatureName to GPUFeatureName mapping
+// WGPUFeatureName to GPUFeatureName mapping (v29 enum values)
 const FEATURE_NAME_MAP: Record<number, GPUFeatureName> = {
-  0x01: "depth-clip-control",
-  0x02: "depth32float-stencil8",
-  0x03: "timestamp-query",
+  0x01: "core-features-and-limits",
+  0x02: "depth-clip-control",
+  0x03: "depth32float-stencil8",
   0x04: "texture-compression-bc",
   0x05: "texture-compression-bc-sliced-3d",
   0x06: "texture-compression-etc2",
   0x07: "texture-compression-astc",
-  0x08: "indirect-first-instance",
-  0x09: "shader-f16",
-  0x0A: "rg11b10ufloat-renderable",
-  0x0B: "bgra8unorm-storage",
-  0x0C: "float32-filterable",
-  0x0D: "float32-blendable",
-  0x0E: "clip-distances",
-  0x0F: "dual-source-blending",
+  0x08: "texture-compression-astc-sliced-3d",
+  0x09: "timestamp-query",
+  0x0A: "indirect-first-instance",
+  0x0B: "shader-f16",
+  0x0C: "rg11b10ufloat-renderable",
+  0x0D: "bgra8unorm-storage",
+  0x0E: "float32-filterable",
+  0x0F: "float32-blendable",
+  0x10: "clip-distances",
+  0x11: "dual-source-blending",
+  0x12: "subgroups",
+  0x13: "texture-formats-tier-1",
+  0x14: "texture-formats-tier-2",
+  0x15: "primitive-index",
+  0x16: "texture-component-swizzle",
 };
+
+// Reverse map: GPUFeatureName → native feature ID
+const FEATURE_NAME_TO_ID: Record<string, number> = {};
+for (const [id, name] of Object.entries(FEATURE_NAME_MAP)) {
+  FEATURE_NAME_TO_ID[name] = Number(id);
+}
+
+// Native extension features (WGPUNativeFeature) mapped to GPUFeatureName
+const NATIVE_FEATURE_MAP: Record<number, GPUFeatureName> = {
+  0x00030001: "immediate-data",
+};
+// Reverse map for native features
+const NATIVE_FEATURE_NAME_TO_ID: Record<string, number> = {};
+for (const [id, name] of Object.entries(NATIVE_FEATURE_MAP)) {
+  NATIVE_FEATURE_NAME_TO_ID[name] = Number(id);
+}
 
 // Backend type mapping
 const BACKEND_TYPE_MAP: Record<number, string> = {
@@ -71,15 +94,8 @@ export class GPUAdapterImpl extends GPUObjectBase implements GPUAdapter {
   }
 
   private queryLimits(): GPUSupportedLimits {
-    // WGPULimits struct layout (152 bytes):
-    // offset 0: nextInChain (ptr, 8)
-    // offset 8-60: u32 fields
-    // offset 64: maxUniformBufferBindingSize (u64, 8)
-    // offset 72: maxStorageBufferBindingSize (u64, 8)
-    // offset 80-92: u32 fields
-    // offset 96: maxBufferSize (u64, 8)
-    // offset 104-148: u32 fields
-    const limitsBuffer = new Uint8Array(152);
+    // WGPULimits struct layout (v29: 160 bytes with maxImmediateSize)
+    const limitsBuffer = new Uint8Array(160);
     const limitsView = new DataView(limitsBuffer.buffer);
     limitsView.setBigUint64(0, BigInt(0), true); // nextInChain = null
 
@@ -123,6 +139,7 @@ export class GPUAdapterImpl extends GPUObjectBase implements GPUAdapter {
       maxComputeWorkgroupSizeY: limitsView.getUint32(136, true),
       maxComputeWorkgroupSizeZ: limitsView.getUint32(140, true),
       maxComputeWorkgroupsPerDimension: limitsView.getUint32(144, true),
+      maxImmediateSize: limitsView.getUint32(148, true),
     } as GPUSupportedLimits;
   }
 
@@ -151,6 +168,13 @@ export class GPUAdapterImpl extends GPUObjectBase implements GPUAdapter {
       // We need to read from the pointer - create a view into native memory
       // This is tricky with Bun FFI, so let's use wgpuAdapterHasFeature instead
       for (const [featureId, featureName] of Object.entries(FEATURE_NAME_MAP)) {
+        const hasFeature = getLib().wgpuAdapterHasFeature(this._handle, Number(featureId));
+        if (hasFeature === 1) {
+          features.add(featureName as GPUFeatureName);
+        }
+      }
+      // Check native extension features
+      for (const [featureId, featureName] of Object.entries(NATIVE_FEATURE_MAP)) {
         const hasFeature = getLib().wgpuAdapterHasFeature(this._handle, Number(featureId));
         if (hasFeature === 1) {
           features.add(featureName as GPUFeatureName);
@@ -285,12 +309,48 @@ export class GPUAdapterImpl extends GPUObjectBase implements GPUAdapter {
         { args: ["ptr", "u32", "ptr", "usize"], returns: "void" }
       );
 
+      // Build required features array from descriptor
+      let requiredFeaturesPtr: Pointer = 0 as Pointer;
+      let requiredFeatureCount = 0;
+      if (descriptor?.requiredFeatures) {
+        const requested = Array.from(descriptor.requiredFeatures);
+        const featureIds = new Uint32Array(requested.length);
+        let idx = 0;
+        for (const name of requested) {
+          // Try standard feature map first, then native
+          const id = FEATURE_NAME_TO_ID[name] ?? NATIVE_FEATURE_NAME_TO_ID[name];
+          if (id !== undefined) {
+            featureIds[idx++] = id;
+          }
+        }
+        if (idx > 0) {
+          const featuresBytes = new Uint8Array(idx * 4);
+          new Uint32Array(featuresBytes.buffer).set(featureIds.slice(0, idx));
+          (encoder as any).allocations.push(featuresBytes);
+          requiredFeaturesPtr = ptr(featuresBytes) as Pointer;
+          requiredFeatureCount = idx;
+        }
+      }
+
+      // Build required limits from descriptor (if provided)
+      let requiredLimitsPtr: Pointer = 0 as Pointer;
+      if (descriptor?.requiredLimits) {
+        const limitsValues: Record<string, unknown> = { nextInChain: 0 };
+        // Copy all provided limits, defaulting undefined values to 0
+        for (const field of WGPULimits.fields) {
+          if (field.name === "nextInChain") continue;
+          const key = field.name as keyof GPUSupportedLimits;
+          limitsValues[field.name] = (descriptor.requiredLimits as any)?.[key] ?? 0;
+        }
+        requiredLimitsPtr = encoder.encode(WGPULimits, limitsValues).ptr;
+      }
+
       const descPtr = encoder.encode(WGPUDeviceDescriptor, {
         nextInChain: 0,
         label: { data: labelStr.data, length: labelStr.length },
-        requiredFeatureCount: 0,
-        requiredFeatures: 0,
-        requiredLimits: 0,
+        requiredFeatureCount,
+        requiredFeatures: requiredFeaturesPtr,
+        requiredLimits: requiredLimitsPtr,
         defaultQueue: {
           nextInChain: 0,
           label: { data: queueLabelStr.data, length: queueLabelStr.length },
@@ -363,6 +423,7 @@ export class GPUAdapterImpl extends GPUObjectBase implements GPUAdapter {
       maxComputeWorkgroupSizeY: 256,
       maxComputeWorkgroupSizeZ: 64,
       maxComputeWorkgroupsPerDimension: 65535,
+      maxImmediateSize: 256,
     } as GPUSupportedLimits;
   }
 }
