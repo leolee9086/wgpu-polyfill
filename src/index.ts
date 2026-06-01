@@ -7,6 +7,33 @@
 import { GPUImpl } from "./gpu";
 import { clearAllBuffers as clearAllBuffersFn } from "./cleanup";
 
+// WebGPU error types (globals, per spec)
+export class GPUValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "GPUValidationError";
+  }
+}
+
+export class GPUOutOfMemoryError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "GPUOutOfMemoryError";
+  }
+}
+
+export class GPUInternalError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "GPUInternalError";
+  }
+}
+
+// Register as globals for CTS compatibility
+(globalThis as any).GPUValidationError = GPUValidationError;
+(globalThis as any).GPUOutOfMemoryError = GPUOutOfMemoryError;
+(globalThis as any).GPUInternalError = GPUInternalError;
+
 // Re-export types for convenience
 export type { Pointer } from "./ffi/types";
 export { GPUImpl } from "./gpu";

@@ -68,10 +68,12 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
   private _limits: GPUSupportedLimits;
   private _adapterInfo: GPUAdapterInfo;
   private _eventListeners: Map<string, EventListenerEntry[]> = new Map();
+  private _nativeErrorCallback: any | null = null;
 
-  constructor(handle: Pointer, instance: Pointer, label: string = "", adapterInfo?: GPUAdapterInfo) {
+  constructor(handle: Pointer, instance: Pointer, label: string = "", adapterInfo?: GPUAdapterInfo, nativeErrorCallback?: any) {
     super(handle, label);
     this._instance = instance;
+    this._nativeErrorCallback = nativeErrorCallback ?? null;
 
     // Get the queue
     const queueHandle = getLib().wgpuDeviceGetQueue(handle);
@@ -1159,17 +1161,35 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     return new GPUQuerySetImpl(handle as Pointer, descriptor.type, descriptor.count, descriptor.label);
   }
 
+  // Error scope stack — wgpu-native only supports "validation" scope natively;
+  // "out-of-memory" and "internal" are tracked in JS to avoid native panics.
+  private _errorScopeStack: Array<{ filter: string; nativePushed: boolean }> = [];
+
   pushErrorScope(filter: GPUErrorFilter): undefined {
-    const filterMap: Record<GPUErrorFilter, number> = {
-      validation: 1,
-      "out-of-memory": 2,
-      internal: 3,
-    };
-    getLib().wgpuDevicePushErrorScope(this._handle, filterMap[filter]);
+    if (filter === "validation") {
+      getLib().wgpuDevicePushErrorScope(this._handle, 1);
+      this._errorScopeStack.push({ filter, nativePushed: true });
+    } else {
+      // wgpu-native v29 panics on "out-of-memory" and "internal";
+      // track them in JS — popErrorScope will return null for these.
+      this._errorScopeStack.push({ filter, nativePushed: false });
+    }
     return;
   }
 
   async popErrorScope(): Promise<GPUError | null> {
+    const entry = this._errorScopeStack.pop();
+    if (!entry) {
+      throw new Error("Error scope stack is empty");
+    }
+
+    if (!entry.nativePushed) {
+      // JS-tracked scope ("out-of-memory" or "internal")
+      // wgpu won't generate these errors, so always return null
+      return null;
+    }
+
+    // Native validation scope — use callback mechanism
     const encoder = new StructEncoder();
     const registry = getCallbackRegistry();
     const handle = createHandle<GPUError | null>();

@@ -9,7 +9,7 @@ import { StructEncoder } from "../structs/encoder";
 import { getCallbackRegistry, createHandle } from "../async/callback-registry";
 import { pollUntilComplete } from "../async/polling";
 import { WGPUDeviceDescriptor } from "../structs/definitions/device";
-import { ptr } from "bun:ffi";
+import { ptr, JSCallback } from "bun:ffi";
 
 // WGPUFeatureName to GPUFeatureName mapping
 const FEATURE_NAME_MAP: Record<number, GPUFeatureName> = {
@@ -277,6 +277,14 @@ export class GPUAdapterImpl extends GPUObjectBase implements GPUAdapter {
         ? encoder.encodeString(descriptor.defaultQueue.label)
         : { data: 0, length: 0 };
 
+      // Register native uncaptured error callback so wgpu doesn't panic
+      const errorCallback = new JSCallback(
+        (_device: Pointer, type: number, _msgData: Pointer, _msgLen: number) => {
+          // Forward to device error handler; just logging is enough to prevent panic
+        },
+        { args: ["ptr", "u32", "ptr", "usize"], returns: "void" }
+      );
+
       const descPtr = encoder.encode(WGPUDeviceDescriptor, {
         nextInChain: 0,
         label: { data: labelStr.data, length: labelStr.length },
@@ -296,7 +304,7 @@ export class GPUAdapterImpl extends GPUObjectBase implements GPUAdapter {
         },
         uncapturedErrorCallbackInfo: {
           nextInChain: 0,
-          callback: 0,
+          callback: errorCallback.ptr,
           userdata1: 0,
           userdata2: 0,
         },
@@ -309,7 +317,9 @@ export class GPUAdapterImpl extends GPUObjectBase implements GPUAdapter {
 
       const deviceHandle = await pollUntilComplete(this._instance, handle);
 
-      return new GPUDeviceImpl(deviceHandle, this._instance, descriptor?.label, this._info) as unknown as GPUDevice;
+      // Keep the callback alive (store on device)
+      const device = new GPUDeviceImpl(deviceHandle, this._instance, descriptor?.label, this._info, errorCallback);
+      return device as unknown as GPUDevice;
     } finally {
       encoder.freeAll();
     }

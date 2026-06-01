@@ -1,16 +1,44 @@
 /**
- * CTS Runner — installs polyfill, then runs CTS command-line.
- *
- * Usage (from wgpu-polyfill/):
- *   bun run run-cts.ts 'webgpu:api,validation,error_scope:*'
- *   bun run run-cts.ts --verbose 'webgpu:api,operation,buffer,map:*'
+ * CTS Runner — installs polyfill, registers globals, runs CTS.
  */
 
-// Install polyfill (import TS source directly to keep lib/ path correct)
+// Install polyfill (this sets navigator.gpu + WebGPU error globals)
 const { installPolyfill } = await import("./src/index.ts");
-installPolyfill(); // Sets navigator.gpu automatically
+installPolyfill();
 
-// CTS checks for src/ in CWD; temporarily chdir to CTS root
+// Register Impl classes as standard WebGPU names for CTS cleanup tracking
+import {
+  GPUDeviceImpl, GPUAdapterImpl, GPUBufferImpl, GPUTextureImpl,
+  GPUSamplerImpl, GPUCommandEncoderImpl, GPUCommandBufferImpl,
+  GPUComputePassEncoderImpl, GPURenderPassEncoderImpl,
+  GPURenderPipelineImpl, GPUQuerySetImpl,
+  GPURenderBundleImpl, GPURenderBundleEncoderImpl,
+  GPUTextureViewImpl,
+  GPUBufferUsage, GPUTextureUsage, GPUMapMode,
+} from "./src/index.ts";
+
+const globals: Record<string, any> = {
+  GPUDevice: GPUDeviceImpl,
+  GPUAdapter: GPUAdapterImpl,
+  GPUBuffer: GPUBufferImpl,
+  GPUTexture: GPUTextureImpl,
+  GPUSampler: GPUSamplerImpl,
+  GPUCommandEncoder: GPUCommandEncoderImpl,
+  GPUCommandBuffer: GPUCommandBufferImpl,
+  GPUComputePassEncoder: GPUComputePassEncoderImpl,
+  GPURenderPassEncoder: GPURenderPassEncoderImpl,
+  GPURenderPipeline: GPURenderPipelineImpl,
+  GPUQuerySet: GPUQuerySetImpl,
+  GPURenderBundle: GPURenderBundleImpl,
+  GPURenderBundleEncoder: GPURenderBundleEncoderImpl,
+  GPUTextureView: GPUTextureViewImpl,
+  GPUBufferUsage, GPUTextureUsage, GPUMapMode,
+};
+for (const [name, val] of Object.entries(globals)) {
+  (globalThis as any)[name] = val;
+}
+
+// CTS checks for src/ in CWD; chdir to CTS root
 const realCwd = process.cwd();
 process.chdir("D:/dev/cts");
 
