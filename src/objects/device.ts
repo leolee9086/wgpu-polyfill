@@ -425,6 +425,59 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     return null;
   }
 
+  /** Depth/stencil format set for validation. */
+  private static DEPTH_FORMATS = new Set([
+    "depth32float", "depth24plus", "depth24plus-stencil8",
+    "depth32float-stencil8", "depth16unorm",
+  ]);
+  private static STENCIL_FORMATS = new Set([
+    "stencil8", "depth24plus-stencil8", "depth32float-stencil8",
+  ]);
+
+  /**
+   * Validate depth/stencil state before passing to wgpu-native (which panics on mismatch).
+   */
+  private validateDepthStencilState(ds: GPUDepthStencilState): GPUValidationError | null {
+    const isDepthFormat = GPUDeviceImpl.DEPTH_FORMATS.has(ds.format);
+    const isStencilFormat = GPUDeviceImpl.STENCIL_FORMATS.has(ds.format);
+
+    // depth format requires depthWriteEnabled to be specified (wgpu panics if undefined)
+    if (isDepthFormat && ds.depthWriteEnabled === undefined) {
+      return new GPUValidationError(
+        `depthWriteEnabled must be specified for depth format "${ds.format}"`
+      );
+    }
+
+    // depthWriteEnabled requires a depth format
+    if (ds.depthWriteEnabled && !isDepthFormat) {
+      return new GPUValidationError(
+        `depthWriteEnabled is true but format "${ds.format}" is not a depth format`
+      );
+    }
+
+    // Stencil operations require a stencil format
+    // Only check properties that are explicitly set (not undefined)
+    if (!isStencilFormat) {
+      const hasStencilOp = (
+        (ds.stencilFront?.failOp !== undefined && ds.stencilFront.failOp !== "keep") ||
+        (ds.stencilFront?.depthFailOp !== undefined && ds.stencilFront.depthFailOp !== "keep") ||
+        (ds.stencilFront?.passOp !== undefined && ds.stencilFront.passOp !== "keep") ||
+        (ds.stencilBack?.failOp !== undefined && ds.stencilBack.failOp !== "keep") ||
+        (ds.stencilBack?.depthFailOp !== undefined && ds.stencilBack.depthFailOp !== "keep") ||
+        (ds.stencilBack?.passOp !== undefined && ds.stencilBack.passOp !== "keep") ||
+        (ds.stencilReadMask !== undefined && ds.stencilReadMask !== 0xFFFFFFFF) ||
+        (ds.stencilWriteMask !== undefined && ds.stencilWriteMask !== 0xFFFFFFFF)
+      );
+      if (hasStencilOp) {
+        return new GPUValidationError(
+          `Stencil operations require a stencil format, but format is "${ds.format}"`
+        );
+      }
+    }
+
+    return null;
+  }
+
   createTexture(descriptor: GPUTextureDescriptor): GPUTexture {
     // Heuristic: estimated bytes per pixel by format
     const formatByteSizes: Record<string, number> = {
@@ -1300,6 +1353,15 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     let depthStencilStatePtr = 0;
     if (descriptor.depthStencil) {
       const ds = descriptor.depthStencil;
+
+      // Validate depth/stencil format before calling native (wgpu panics on mismatch)
+      const depthErr = this.validateDepthStencilState(ds);
+      if (depthErr) {
+        this.captureError(depthErr);
+        const { GPURenderPipelineImpl } = require("./pipeline");
+        return new GPURenderPipelineImpl(0 as Pointer, descriptor.label) as unknown as GPURenderPipeline;
+      }
+
       const depthStencilBuffer = new Uint8Array(72);
       pipelineBuffers.push(depthStencilBuffer);
       const dsView = new DataView(depthStencilBuffer.buffer);
@@ -1431,6 +1493,11 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     if (descriptor.fragment?.module) {
       const immErr = this.validateImmediateSize(descriptor.fragment.module, descriptor.layout);
       if (immErr) return Promise.reject(new GPUPipelineError(immErr.message, { reason: "validation" }));
+    }
+    // Validate depth/stencil state
+    if (descriptor.depthStencil) {
+      const dsErr = this.validateDepthStencilState(descriptor.depthStencil);
+      if (dsErr) return Promise.reject(new GPUPipelineError(dsErr.message, { reason: "validation" }));
     }
     // For render pipeline async, we use the sync version wrapped in a microtask
     // since the full async implementation would require duplicating all the
