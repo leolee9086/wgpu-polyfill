@@ -335,14 +335,29 @@ export class GPUAdapterImpl extends GPUObjectBase implements GPUAdapter {
       // Build required limits from descriptor (if provided)
       let requiredLimitsPtr: Pointer = 0 as Pointer;
       if (descriptor?.requiredLimits) {
-        const limitsValues: Record<string, unknown> = { nextInChain: 0 };
-        // Copy all provided limits, defaulting undefined values to 0
+        // Pre-fill with 0xFF so unset u32 fields = WGPU_LIMIT_U32_UNDEFINED (0xFFFFFFFF)
+        // and unset u64 fields = WGPU_LIMIT_U64_UNDEFINED (0xFFFFFFFFFFFFFFFF)
+        const limitsBuf = new Uint8Array(WGPULimits.size);
+        limitsBuf.fill(0xFF);
+        const limitsView = new DataView(limitsBuf.buffer);
+        limitsView.setBigUint64(0, BigInt(0), true); // nextInChain = 0 (null)
+
+        const src = descriptor.requiredLimits as Record<string, unknown>;
         for (const field of WGPULimits.fields) {
           if (field.name === "nextInChain") continue;
-          const key = field.name as keyof GPUSupportedLimits;
-          limitsValues[field.name] = (descriptor.requiredLimits as any)?.[key] ?? 0;
+          if (field.name in src) {
+            const val = src[field.name];
+            if (val !== undefined && val !== null) {
+              if (field.type === "u64") {
+                limitsView.setBigUint64(field.offset, BigInt(val as number), true);
+              } else {
+                limitsView.setUint32(field.offset, val as number, true);
+              }
+            }
+          }
         }
-        requiredLimitsPtr = encoder.encode(WGPULimits, limitsValues).ptr;
+        (encoder as any).allocations.push(limitsBuf);
+        requiredLimitsPtr = ptr(limitsBuf) as Pointer;
       }
 
       const descPtr = encoder.encode(WGPUDeviceDescriptor, {

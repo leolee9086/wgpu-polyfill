@@ -9,9 +9,12 @@ import { GPUBindGroupLayoutImpl } from "./bind-group";
 
 export class GPUPipelineLayoutImpl extends GPUObjectBase implements GPUPipelineLayout {
   readonly __brand = "GPUPipelineLayout";
+  /** The immediate data size configured for this layout (0 if none). */
+  readonly immediateSize: number;
 
-  constructor(handle: Pointer, label?: string) {
+  constructor(handle: Pointer, label?: string, immediateSize = 0) {
     super(handle, label);
+    this.immediateSize = immediateSize;
   }
 
   protected releaseImpl(): void {

@@ -47,11 +47,14 @@ export class GPUShaderModuleImpl extends GPUObjectBase implements GPUShaderModul
   private _instance: Pointer;
   /** Entry points parsed from WGSL source, used for entry point validation. */
   readonly entryPoints: EntryPointInfo[];
+  /** Immediate data size in bytes (0 if not using var<immediate>). */
+  readonly immediateDataSize: number;
 
-  constructor(handle: Pointer, instance: Pointer, label?: string, entryPoints?: EntryPointInfo[]) {
+  constructor(handle: Pointer, instance: Pointer, label?: string, entryPoints?: EntryPointInfo[], immediateDataSize = 0) {
     super(handle, label);
     this._instance = instance;
     this.entryPoints = entryPoints ?? [];
+    this.immediateDataSize = immediateDataSize;
   }
 
   protected releaseImpl(): void {

@@ -505,6 +505,69 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     return entries;
   }
 
+  /**
+   * Detect the immediate data size (in bytes) used by a WGSL shader.
+   * Looks for `var<immediate> data: <StructName>;` and then finds the
+   * struct definition to count fields. Returns 0 if no immediate data.
+   *
+   * Example WGSL from CTS:
+   *   struct Immediates { m0: u32, m1: u32, m2: u32, m3: u32 }
+   *   var<immediate> data: Immediates;
+   */
+  private detectImmediateSize(wgsl: string): number {
+    if (!wgsl.includes("immediate")) return 0;
+
+    // Find struct name after `var<immediate> data:`
+    const varMatch = wgsl.match(/var<immediate>\s+\w+\s*:\s*(\w+)\s*;/);
+    if (!varMatch) return 0;
+
+    const structName = varMatch[1];
+
+    // Find struct definition using manual scanning to avoid escape issues
+    const searchStr = "struct " + structName;
+    const idx = wgsl.indexOf(searchStr);
+    if (idx === -1) return 0;
+
+    const openBrace = wgsl.indexOf("{", idx);
+    if (openBrace === -1) return 0;
+
+    const closeBrace = wgsl.indexOf("}", openBrace);
+    if (closeBrace === -1) return 0;
+
+    const structBody = wgsl.slice(openBrace + 1, closeBrace);
+    // Count WGSL struct fields (e.g., "m0: u32, m1: u32, ...")
+    const fieldRegex = /(\w+)\s*:\s*\w+/g;
+    const fields = structBody.match(fieldRegex);
+    return (fields?.length ?? 0) * 4;
+  }
+
+  /**
+   * Validate that the shader's immediate data size doesn't exceed
+   * the pipeline layout's immediateSize (or device maxImmediateSize for auto).
+   */
+  private validateImmediateSize(
+    shaderModule: GPUShaderModule,
+    layout: GPUPipelineLayout | "auto" | undefined,
+  ): GPUValidationError | null {
+    const mod = shaderModule as unknown as { immediateDataSize?: number };
+    const shaderSize = mod.immediateDataSize ?? 0;
+    if (shaderSize === 0) return null; // No immediate data used
+
+    let maxSize = 0;
+    if (layout === "auto") {
+      maxSize = (this._limits as any).maxImmediateSize ?? 0;
+    } else if (layout) {
+      maxSize = (layout as any).immediateSize ?? 0;
+    }
+
+    if (shaderSize > maxSize) {
+      return new GPUValidationError(
+        `Shader uses ${shaderSize} bytes of immediate data, but layout allows only ${maxSize} bytes`
+      );
+    }
+    return null;
+  }
+
   createTexture(descriptor: GPUTextureDescriptor): GPUTexture {
     // Heuristic: estimated bytes per pixel by format
     const formatByteSizes: Record<string, number> = {
@@ -899,7 +962,11 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     encoder.freeAll();
 
     const { GPUPipelineLayoutImpl } = require("./pipeline");
-    return new GPUPipelineLayoutImpl(pipelineLayoutHandle, descriptor.label) as unknown as GPUPipelineLayout;
+    return new GPUPipelineLayoutImpl(
+      pipelineLayoutHandle,
+      descriptor.label,
+      (descriptor as any).immediateSize ?? 0
+    ) as unknown as GPUPipelineLayout;
   }
 
   createShaderModule(descriptor: GPUShaderModuleDescriptor): GPUShaderModule {
@@ -913,6 +980,9 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
 
     // Parse entry points from WGSL source for validation
     const entryPoints = this.parseWGSLShaderEntryPoints(code);
+
+    // Detect immediate data size for validation
+    const immediateDataSize = this.detectImmediateSize(code);
 
     // Allocate null-terminated code string
     const codeBytes = new TextEncoder().encode(code + "\0");
@@ -949,7 +1019,7 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     }
 
     const { GPUShaderModuleImpl } = require("./shader-module");
-    return new GPUShaderModuleImpl(moduleHandle, this._instance, descriptor.label, entryPoints) as unknown as GPUShaderModule;
+    return new GPUShaderModuleImpl(moduleHandle, this._instance, descriptor.label, entryPoints, immediateDataSize) as unknown as GPUShaderModule;
   }
 
   createComputePipeline(descriptor: GPUComputePipelineDescriptor): GPUComputePipeline {
@@ -965,6 +1035,14 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     const entryPointError = this.validateEntryPoint(entryPoint, shaderModule, "compute");
     if (entryPointError) {
       this.captureError(entryPointError);
+      const { GPUComputePipelineImpl } = require("./pipeline");
+      return new GPUComputePipelineImpl(0 as Pointer, descriptor.label) as unknown as GPUComputePipeline;
+    }
+
+    // Validate immediate data size against layout
+    const immediateError = this.validateImmediateSize(shaderModule, descriptor.layout);
+    if (immediateError) {
+      this.captureError(immediateError);
       const { GPUComputePipelineImpl } = require("./pipeline");
       return new GPUComputePipelineImpl(0 as Pointer, descriptor.label) as unknown as GPUComputePipeline;
     }
@@ -1017,6 +1095,8 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
   createComputePipelineAsync(descriptor: GPUComputePipelineDescriptor): Promise<GPUComputePipeline> {
     const entryPointError = this.validateEntryPoint(descriptor.compute.entryPoint, descriptor.compute.module, "compute");
     if (entryPointError) return Promise.reject(new GPUPipelineError(entryPointError.message, { reason: "validation" }));
+    const immError = this.validateImmediateSize(descriptor.compute.module, descriptor.layout);
+    if (immError) return Promise.reject(new GPUPipelineError(immError.message, { reason: "validation" }));
     // wgpu-native async pipeline creation is not fully implemented,
     // so we use the sync version wrapped in a microtask to provide
     // the async API contract.
@@ -1058,6 +1138,16 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
       this.captureError(fragmentEntryPointError);
       const { GPURenderPipelineImpl } = require("./pipeline");
       return new GPURenderPipelineImpl(0 as Pointer, descriptor.label) as unknown as GPURenderPipeline;
+    }
+
+    // Validate immediate data size for vertex and fragment shaders
+    if (descriptor.vertex.module) {
+      const immErr = this.validateImmediateSize(descriptor.vertex.module, descriptor.layout);
+      if (immErr) { this.captureError(immErr); return new (require("./pipeline").GPURenderPipelineImpl)(0 as Pointer, descriptor.label) as unknown as GPURenderPipeline; }
+    }
+    if (descriptor.fragment?.module) {
+      const immErr = this.validateImmediateSize(descriptor.fragment.module, descriptor.layout);
+      if (immErr) { this.captureError(immErr); return new (require("./pipeline").GPURenderPipelineImpl)(0 as Pointer, descriptor.label) as unknown as GPURenderPipeline; }
     }
 
     // Allocate entry point strings
@@ -1476,6 +1566,15 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
       ? this.validateEntryPoint(descriptor.fragment.entryPoint, descriptor.fragment.module, "fragment")
       : null;
     if (fragmentEntryPointError) return Promise.reject(new GPUPipelineError(fragmentEntryPointError.message, { reason: "validation" }));
+    // Validate immediate data size for vertex and fragment shaders
+    if (descriptor.vertex.module) {
+      const immErr = this.validateImmediateSize(descriptor.vertex.module, descriptor.layout);
+      if (immErr) return Promise.reject(new GPUPipelineError(immErr.message, { reason: "validation" }));
+    }
+    if (descriptor.fragment?.module) {
+      const immErr = this.validateImmediateSize(descriptor.fragment.module, descriptor.layout);
+      if (immErr) return Promise.reject(new GPUPipelineError(immErr.message, { reason: "validation" }));
+    }
     // For render pipeline async, we use the sync version wrapped in a microtask
     // since the full async implementation would require duplicating all the
     // complex descriptor encoding. This still provides the async API contract.
