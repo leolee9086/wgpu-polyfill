@@ -22,6 +22,7 @@ import { GPUQuerySetImpl, createQuerySetDescriptor } from "./query-set";
 import { GPURenderBundleEncoderImpl, createRenderBundleEncoderDescriptor } from "./render-bundle";
 import { getCallbackRegistry, createHandle } from "../async/callback-registry";
 import { pollUntilComplete } from "../async/polling";
+import { parseEntryPoints, detectImmediateSize } from "../wgsl/parser";
 
 
 // Global buffer storage to prevent GC issues
@@ -395,150 +396,6 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
       }
     }
     return null;
-  }
-
-  /**
-   * Parse entry point names from WGSL source code.
-   * Uses a proper scanner (not regex) to handle comments and strings.
-   *
-   * WGSL entry point syntax:
-   *   @vertex fn name(...) { ... }
-   *   @fragment fn name(...) { ... }
-   *   @compute fn name(...) { ... }
-   *
-   * Multiple attributes may precede fn (e.g. @compute @workgroup_size(1)).
-   */
-  private parseWGSLShaderEntryPoints(wgsl: string): Array<{ name: string; stage: string }> {
-    const entries: Array<{ name: string; stage: string }> = [];
-    const len = wgsl.length;
-
-    // Scan helpers
-    const isIdentStart = (c: string) => /[a-zA-Z_]/.test(c) || (c.codePointAt(0) ?? 0) > 0x7f;
-    const isIdentCont = (c: string) => isIdentStart(c) || /[0-9]/.test(c);
-    const isSpace = (c: string) => c === ' ' || c === '\t' || c === '\n' || c === '\r';
-
-    let i = 0;
-    let pendingAttr: string | null = null;
-
-    const next = () => {
-      if (i < len) {
-        const c = wgsl[i];
-        i++;
-        return c;
-      }
-      return '';
-    };
-    const peek = (n = 0) => (i + n < len ? wgsl[i + n] : '');
-    const skipSpace = () => { while (i < len && isSpace(wgsl[i])) i++; };
-
-    while (i < len) {
-      const c = wgsl[i];
-
-      // Line comment: //
-      if (c === '/' && peek(1) === '/') {
-        while (i < len && wgsl[i] !== '\n') i++;
-        continue;
-      }
-
-      // Block comment: /* ... */
-      if (c === '/' && peek(1) === '*') {
-        i += 2;
-        while (i < len - 1 && !(wgsl[i] === '*' && peek(1) === '/')) i++;
-        i += 2; // skip */
-        continue;
-      }
-
-      // Skip string literals (WGSL has no string literals in the traditional
-      // sense, but shader might have attribute strings or similar)
-      if (c === '"' || c === "'") {
-        const quote = c;
-        i++;
-        while (i < len && wgsl[i] !== quote) {
-          if (wgsl[i] === '\\') i++; // skip escape
-          i++;
-        }
-        if (i < len) i++; // skip closing quote
-        continue;
-      }
-
-      // Attribute: @identifier
-      // Only track vertex/fragment/compute attributes; skip others
-      if (c === '@') {
-        i++;
-        let attr = '';
-        while (i < len && isIdentCont(wgsl[i])) {
-          attr += wgsl[i];
-          i++;
-        }
-        if (attr === 'vertex' || attr === 'fragment' || attr === 'compute') {
-          pendingAttr = attr;
-        }
-        continue;
-      }
-
-      // fn keyword
-      if (c === 'f' && peek(1) === 'n' && !isIdentCont(peek(2))) {
-        i += 2; // skip 'fn'
-        skipSpace();
-        // Read identifier (function name)
-        let name = '';
-        if (i < len && isIdentStart(wgsl[i])) {
-          while (i < len && isIdentCont(wgsl[i])) {
-            name += wgsl[i];
-            i++;
-          }
-        }
-        // If we had a stage attribute, record the entry point
-        if (name && pendingAttr && (pendingAttr === 'vertex' || pendingAttr === 'fragment' || pendingAttr === 'compute')) {
-          if (!entries.some(e => e.name === name && e.stage === pendingAttr)) {
-            entries.push({ name, stage: pendingAttr });
-          }
-        }
-        pendingAttr = null;
-        continue;
-      }
-
-      // Any other character — consume and move on
-      i++;
-    }
-
-    return entries;
-  }
-
-  /**
-   * Detect the immediate data size (in bytes) used by a WGSL shader.
-   * Looks for `var<immediate> data: <StructName>;` and then finds the
-   * struct definition to count fields. Returns 0 if no immediate data.
-   *
-   * Example WGSL from CTS:
-   *   struct Immediates { m0: u32, m1: u32, m2: u32, m3: u32 }
-   *   var<immediate> data: Immediates;
-   */
-  private detectImmediateSize(wgsl: string): number {
-    if (!wgsl.includes("immediate")) return 0;
-
-    // Find struct name after `var<immediate> data:`
-    const varMatch = wgsl.match(/var<immediate>\s+\w+\s*:\s*(\w+)\s*;/);
-    if (!varMatch) return 0;
-
-    const structName = varMatch[1];
-
-    // Find struct definition using manual scanning to avoid escape issues
-    const searchStr = "struct " + structName;
-    const idx = wgsl.indexOf(searchStr);
-    if (idx === -1) return 0;
-
-    const openBrace = wgsl.indexOf("{", idx);
-    if (openBrace === -1) return 0;
-
-    const closeBrace = wgsl.indexOf("}", openBrace);
-    if (closeBrace === -1) return 0;
-
-    const structBody = wgsl.slice(openBrace + 1, closeBrace);
-    // Count WGSL struct fields (e.g., "m0: u32, m1: u32, ...")
-    const fieldRegex = /(\w+)\s*:\s*\w+/g;
-    const fields = structBody.match(fieldRegex);
-    return (fields?.length ?? 0) * 4;
   }
 
   /**
@@ -979,10 +836,10 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     }
 
     // Parse entry points from WGSL source for validation
-    const entryPoints = this.parseWGSLShaderEntryPoints(code);
+    const entryPoints = parseEntryPoints(code);
 
     // Detect immediate data size for validation
-    const immediateDataSize = this.detectImmediateSize(code);
+    const immediateDataSize = detectImmediateSize(code);
 
     // Allocate null-terminated code string
     const codeBytes = new TextEncoder().encode(code + "\0");
