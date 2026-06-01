@@ -858,28 +858,30 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
       "unorm10-10-10-2": 0x28, "unorm8x4-bgra": 0x29,
     };
 
-    // Vertex step mode enum
+    // Vertex step mode enum (v29: Undefined=0, Vertex=1, Instance=2)
     const stepModeMap: Record<string, number> = {
-      "vertex": 0x02,
-      "instance": 0x03,
+      "vertex": 0x01,
+      "instance": 0x02,
     };
 
     // Encode vertex buffer layouts
-    // WGPUVertexAttribute (24 bytes with alignment):
-    // offset 0:  format (u32, 4)
-    // offset 4:  padding (4 for 8-byte alignment)
-    // offset 8:  offset (u64, 8)
-    // offset 16: shaderLocation (u32, 4)
-    // offset 20: padding (4)
-    // Total: 24 bytes
-
-    // WGPUVertexBufferLayout (32 bytes):
-    // offset 0:  stepMode (u32, 4)
-    // offset 4:  padding (4)
-    // offset 8:  arrayStride (u64, 8)
-    // offset 16: attributeCount (size_t, 8)
-    // offset 24: attributes (ptr, 8)
+    // WGPUVertexAttribute (32 bytes in v29):
+    // offset 0:  nextInChain (ptr, 8)
+    // offset 8:  format (u32, 4)
+    // offset 12: padding (4)
+    // offset 16: offset (u64, 8)
+    // offset 24: shaderLocation (u32, 4)
+    // offset 28: padding (4)
     // Total: 32 bytes
+
+    // WGPUVertexBufferLayout (40 bytes in v29):
+    // offset 0:  nextInChain (ptr, 8)
+    // offset 8:  stepMode (u32, 4)
+    // offset 12: padding (4)
+    // offset 16: arrayStride (u64, 8)
+    // offset 24: attributeCount (size_t, 8)
+    // offset 32: attributes (ptr, 8)
+    // Total: 40 bytes
 
     let vertexBuffersPtr = 0;
     let vertexBufferCount = 0;
@@ -895,41 +897,44 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
           continue;
         }
         const attributes = Array.from(buffer.attributes);
-        const attrsBuffer = new Uint8Array(attributes.length * 24);
+        const attrsBuffer = new Uint8Array(attributes.length * 32);
         pipelineBuffers.push(attrsBuffer);
 
         for (let j = 0; j < attributes.length; j++) {
           const attr = attributes[j];
-          const attrView = new DataView(attrsBuffer.buffer, j * 24, 24);
-          attrView.setUint32(0, vertexFormatMap[attr.format] ?? 0x1C, true); // format
-          attrView.setUint32(4, 0, true); // padding
-          attrView.setBigUint64(8, BigInt(attr.offset), true); // offset
-          attrView.setUint32(16, attr.shaderLocation, true); // shaderLocation
-          attrView.setUint32(20, 0, true); // padding
+          const attrView = new DataView(attrsBuffer.buffer, j * 32, 32);
+          attrView.setBigUint64(0, BigInt(0), true); // nextInChain = null
+          attrView.setUint32(8, vertexFormatMap[attr.format] ?? 0x1C, true); // format
+          attrView.setUint32(12, 0, true); // padding
+          attrView.setBigUint64(16, BigInt(attr.offset), true); // offset
+          attrView.setUint32(24, attr.shaderLocation, true); // shaderLocation
+          attrView.setUint32(28, 0, true); // padding
         }
         allAttributePtrs.push(ptr(attrsBuffer) as unknown as number);
       }
 
       // Now encode the buffer layouts
-      const buffersBuffer = new Uint8Array(buffers.length * 32);
+      const buffersBuffer = new Uint8Array(buffers.length * 40);
       pipelineBuffers.push(buffersBuffer);
 
       for (let i = 0; i < buffers.length; i++) {
         const buffer = buffers[i];
-        const bufView = new DataView(buffersBuffer.buffer, i * 32, 32);
+        const bufView = new DataView(buffersBuffer.buffer, i * 40, 40);
         if (!buffer) {
-          // Hole in array - use VertexBufferNotUsed
-          bufView.setUint32(0, 0, true); // stepMode = VertexBufferNotUsed
-          bufView.setUint32(4, 0, true); // padding
-          bufView.setBigUint64(8, BigInt(0), true); // arrayStride
-          bufView.setBigUint64(16, BigInt(0), true); // attributeCount
-          bufView.setBigUint64(24, BigInt(0), true); // attributes
+          // Hole in array - use stepMode = Undefined (0)
+          bufView.setBigUint64(0, BigInt(0), true); // nextInChain = null
+          bufView.setUint32(8, 0, true); // stepMode = Undefined
+          bufView.setUint32(12, 0, true); // padding
+          bufView.setBigUint64(16, BigInt(0), true); // arrayStride
+          bufView.setBigUint64(24, BigInt(0), true); // attributeCount
+          bufView.setBigUint64(32, BigInt(0), true); // attributes
         } else {
-          bufView.setUint32(0, stepModeMap[buffer.stepMode ?? "vertex"] ?? 0x02, true);
-          bufView.setUint32(4, 0, true); // padding
-          bufView.setBigUint64(8, BigInt(buffer.arrayStride), true);
-          bufView.setBigUint64(16, BigInt(buffer.attributes?.length ?? 0), true);
-          bufView.setBigUint64(24, BigInt(allAttributePtrs[i]), true);
+          bufView.setBigUint64(0, BigInt(0), true); // nextInChain = null
+          bufView.setUint32(8, stepModeMap[buffer.stepMode ?? "vertex"] ?? 0x01, true);
+          bufView.setUint32(12, 0, true); // padding
+          bufView.setBigUint64(16, BigInt(buffer.arrayStride), true);
+          bufView.setBigUint64(24, BigInt(buffer.attributes?.length ?? 0), true);
+          bufView.setBigUint64(32, BigInt(allAttributePtrs[i]), true);
         }
       }
       vertexBuffersPtr = ptr(buffersBuffer) as unknown as number;
@@ -1282,21 +1287,32 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     return new GPUQuerySetImpl(handle as Pointer, descriptor.type, descriptor.count, descriptor.label);
   }
 
-  // Pure-JS error scope stack.
-  // wgpu-native's error handling is unreliable for CTS:
-  // - It panics on "out-of-memory" and "internal" error filters
-  // - It panics on invalid buffer usage (0xFFFF)
-  // - Error propagation between scopes is fragile
+  // Error scope stack.
+  // wgpu-native only supports "validation" error filters; "out-of-memory" and
+  // "internal" filters panic wgpu-native if pushed directly. So we layer a
+  // pure-JS scope stack on top:
   //
-  // We use a JS shadow stack that intercepts validation errors from
-  // our own createBuffer/createTexture (the APIs that wgpu validates)
-  // and returns them correctly when popErrorScope is called.
+  //   1. Every pushErrorScope (any filter) also pushes a "validation" scope to
+  //      native, keeping the native stack balanced so pop never gets a stale
+  //      empty-stack error.
+  //
+  //   2. When a TS-level API (createBuffer, createTexture, …) detects an error,
+  //      it calls captureError(), which walks the JS scope stack inward-to-outer
+  //      looking for the first scope whose filter matches the error type.  If no
+  //      scope matches, the error is dispatched as an uncaptured error event.
+  //
+  //   3. popErrorScope pops from both stacks.  JS-tracked errors take priority
+  //      (they carry the best diagnostics).  If the JS scope has no error, the
+  //      native result is used as a fallback — this preserves real wgpu errors
+  //      (format issues, internal device errors, etc.) for debugging.
+  //
+  // Native-scope error propagation across filters (e.g. a GPUValidationError
+  // captured in an "out-of-memory" scope propagating outward) is NOT supported
+  // because wgpu-native consumes the error on pop and there is no re-push API.
+  // Errors that don't match the topmost filter are returned as null.
   private _errorScopeStack: Array<{ filter: GPUErrorFilter; error: GPUError | null }> = [];
 
   pushErrorScope(filter: GPUErrorFilter): undefined {
-    // Keep native stack balanced (push validation placeholder)
-    // so that native pop never returns an "empty stack" error
-    // when we call it. We ignore the native result completely.
     getLib().wgpuDevicePushErrorScope(this._handle, 1);
     this._errorScopeStack.push({ filter, error: null });
     return;
@@ -1308,17 +1324,34 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
       throw new DOMException("Error scope stack is empty", "OperationError");
     }
 
-    // Pop native to keep stack balanced (discard result)
+    // Pop native to keep stack balanced; capture result for diagnostics
+    const nativeResult = await this.popNativeErrorScope();
+
+    // 1) JS-tracked error (our TS-layer validation) — best diagnostics
+    if (entry.error) return entry.error;
+
+    // 2) Native error that matches this scope's filter — real wgpu info
+    if (nativeResult && this.errorMatchesFilter(nativeResult, entry.filter)) {
+      return nativeResult;
+    }
+
+    // 3) No match — nothing captured for this scope
+    return null;
+  }
+
+  /**
+   * Pop the native error scope and return the result.
+   * This keeps the native stack in sync with our JS stack.
+   */
+  private async popNativeErrorScope(): Promise<GPUError | null> {
     const encoder = new StructEncoder();
     const registry = getCallbackRegistry();
     const handle = createHandle<GPUError | null>();
     const callbackInfoPtr = registry.createPopErrorScopeCallback(encoder, handle);
     getLib().wgpuDevicePopErrorScope(this._handle, callbackInfoPtr);
-    await pollUntilComplete(this._instance, handle);
+    const result = await pollUntilComplete(this._instance, handle);
     encoder.freeAll();
-
-    // Return the JS-tracked error if one was captured for this scope
-    return entry.error;
+    return result;
   }
 
   /**
