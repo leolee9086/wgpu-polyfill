@@ -437,7 +437,7 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
   /**
    * Validate depth/stencil state before passing to wgpu-native (which panics on mismatch).
    */
-  private validateDepthStencilState(ds: GPUDepthStencilState): GPUValidationError | null {
+  private validateDepthStencilState(ds: GPUDepthStencilState, topology?: string): GPUValidationError | null {
     const isDepthFormat = GPUDeviceImpl.DEPTH_FORMATS.has(ds.format);
     const isStencilFormat = GPUDeviceImpl.STENCIL_FORMATS.has(ds.format);
 
@@ -471,6 +471,20 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
       if (hasStencilOp) {
         return new GPUValidationError(
           `Stencil operations require a stencil format, but format is "${ds.format}"`
+        );
+      }
+    }
+
+    // Depth bias is only valid for triangle topologies
+    if (topology) {
+      const triangleTopologies = new Set(["triangle-list", "triangle-strip"]);
+      const hasDepthBias =
+        (ds.depthBias !== undefined && ds.depthBias !== 0) ||
+        (ds.depthBiasClamp !== undefined && ds.depthBiasClamp !== 0) ||
+        (ds.depthBiasSlopeScale !== undefined && ds.depthBiasSlopeScale !== 0);
+      if (hasDepthBias && !triangleTopologies.has(topology)) {
+        return new GPUValidationError(
+          `Depth bias is only valid for triangle topologies, but topology is "${topology}"`
         );
       }
     }
@@ -1355,7 +1369,7 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
       const ds = descriptor.depthStencil;
 
       // Validate depth/stencil format before calling native (wgpu panics on mismatch)
-      const depthErr = this.validateDepthStencilState(ds);
+      const depthErr = this.validateDepthStencilState(ds, descriptor.primitive?.topology);
       if (depthErr) {
         this.captureError(depthErr);
         const { GPURenderPipelineImpl } = require("./pipeline");
@@ -1496,7 +1510,7 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     }
     // Validate depth/stencil state
     if (descriptor.depthStencil) {
-      const dsErr = this.validateDepthStencilState(descriptor.depthStencil);
+      const dsErr = this.validateDepthStencilState(descriptor.depthStencil, descriptor.primitive?.topology);
       if (dsErr) return Promise.reject(new GPUPipelineError(dsErr.message, { reason: "validation" }));
     }
     // For render pipeline async, we use the sync version wrapped in a microtask
