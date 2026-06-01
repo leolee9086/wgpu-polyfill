@@ -15,12 +15,15 @@ export class GPUShaderModuleImpl extends GPUObjectBase implements GPUShaderModul
   readonly entryPoints: EntryPointInfo[];
   /** Immediate data size in bytes (0 if not using var<immediate>). */
   readonly immediateDataSize: number;
+  /** Whether the shader references @builtin(frag_depth). */
+  readonly hasFragDepth: boolean;
 
-  constructor(handle: Pointer, instance: Pointer, label?: string, entryPoints?: EntryPointInfo[], immediateDataSize = 0) {
+  constructor(handle: Pointer, instance: Pointer, label?: string, entryPoints?: EntryPointInfo[], immediateDataSize = 0, hasFragDepth = false) {
     super(handle, label);
     this._instance = instance;
     this.entryPoints = entryPoints ?? [];
     this.immediateDataSize = immediateDataSize;
+    this.hasFragDepth = hasFragDepth;
   }
 
   protected releaseImpl(): void {

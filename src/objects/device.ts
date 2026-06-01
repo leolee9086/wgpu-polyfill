@@ -436,15 +436,48 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
 
   /**
    * Validate depth/stencil state before passing to wgpu-native (which panics on mismatch).
+   *
+   * Per WebGPU spec:
+   * - depthStencil state format must be a depth or stencil format
+   * - depthCompare requires the format to have a depth aspect
+   * - depthWriteEnabled requires the format to have a depth aspect
+   * - stencilFront/stencilBack ops (compare, failOp, depthFailOp, passOp,
+   *   readMask, writeMask) require the format to have a stencil aspect
+   * - depth format requires depthWriteEnabled to be specified
+   * - depth format with depth enabled or non-default stencil state requires depthCompare
+   * - depth bias is only valid for triangle topologies
    */
   private validateDepthStencilState(ds: GPUDepthStencilState, topology?: string): GPUValidationError | null {
     const isDepthFormat = GPUDeviceImpl.DEPTH_FORMATS.has(ds.format);
     const isStencilFormat = GPUDeviceImpl.STENCIL_FORMATS.has(ds.format);
 
+    // Format must be a depth/stencil format
+    if (!isDepthFormat && !isStencilFormat) {
+      return new GPUValidationError(
+        `Format "${ds.format}" is not a depth or stencil format`
+      );
+    }
+
+    // depthWriteEnabled requires a depth format
+    if (ds.depthWriteEnabled && !isDepthFormat) {
+      return new GPUValidationError(
+        `depthWriteEnabled is true but format "${ds.format}" is not a depth format`
+      );
+    }
+
     // depth format requires depthWriteEnabled to be specified (wgpu panics if undefined)
     if (isDepthFormat && ds.depthWriteEnabled === undefined) {
       return new GPUValidationError(
         `depthWriteEnabled must be specified for depth format "${ds.format}"`
+      );
+    }
+
+    // depthCompare that actually enables depth testing (not "always") requires depth aspect.
+    // When depthCompare is "always" (or undefined) the comparison always passes, so it's
+    // effectively a no-op and is valid on any format (per spec: ignored for non-depth).
+    if (ds.depthCompare !== undefined && ds.depthCompare !== "always" && !isDepthFormat) {
+      return new GPUValidationError(
+        `depthCompare requires a depth format, but "${ds.format}" has no depth aspect`
       );
     }
 
@@ -457,39 +490,17 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
       }
     }
 
-    // Stencil operations require a stencil format
+    // Stencil operations (compare, failOp, depthFailOp, passOp, readMask, writeMask)
+    // require a stencil format.  The default values are:
+    //   compare = "always", failOp = "keep", depthFailOp = "keep",
+    //   passOp = "keep", readMask = 0xFFFFFFFF, writeMask = 0xFFFFFFFF
     if (!isStencilFormat) {
       const hasStencilOp = (
+        (ds.stencilFront?.compare !== undefined && ds.stencilFront.compare !== "always") ||
         (ds.stencilFront?.failOp !== undefined && ds.stencilFront.failOp !== "keep") ||
         (ds.stencilFront?.depthFailOp !== undefined && ds.stencilFront.depthFailOp !== "keep") ||
         (ds.stencilFront?.passOp !== undefined && ds.stencilFront.passOp !== "keep") ||
-        (ds.stencilBack?.failOp !== undefined && ds.stencilBack.failOp !== "keep") ||
-        (ds.stencilBack?.depthFailOp !== undefined && ds.stencilBack.depthFailOp !== "keep") ||
-        (ds.stencilBack?.passOp !== undefined && ds.stencilBack.passOp !== "keep") ||
-        (ds.stencilReadMask !== undefined && ds.stencilReadMask !== 0xFFFFFFFF) ||
-        (ds.stencilWriteMask !== undefined && ds.stencilWriteMask !== 0xFFFFFFFF)
-      );
-      if (hasStencilOp) {
-        return new GPUValidationError(
-          `Stencil operations require a stencil format, but format is "${ds.format}"`
-        );
-      }
-    }
-
-    // depthWriteEnabled requires a depth format
-    if (ds.depthWriteEnabled && !isDepthFormat) {
-      return new GPUValidationError(
-        `depthWriteEnabled is true but format "${ds.format}" is not a depth format`
-      );
-    }
-
-    // Stencil operations require a stencil format
-    // Only check properties that are explicitly set (not undefined)
-    if (!isStencilFormat) {
-      const hasStencilOp = (
-        (ds.stencilFront?.failOp !== undefined && ds.stencilFront.failOp !== "keep") ||
-        (ds.stencilFront?.depthFailOp !== undefined && ds.stencilFront.depthFailOp !== "keep") ||
-        (ds.stencilFront?.passOp !== undefined && ds.stencilFront.passOp !== "keep") ||
+        (ds.stencilBack?.compare !== undefined && ds.stencilBack.compare !== "always") ||
         (ds.stencilBack?.failOp !== undefined && ds.stencilBack.failOp !== "keep") ||
         (ds.stencilBack?.depthFailOp !== undefined && ds.stencilBack.depthFailOp !== "keep") ||
         (ds.stencilBack?.passOp !== undefined && ds.stencilBack.passOp !== "keep") ||
@@ -522,15 +533,40 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
 
   private isDefaultStencilState(ds: GPUDepthStencilState): boolean {
     return (
+      (ds.stencilFront?.compare === undefined || ds.stencilFront.compare === "always") &&
       (ds.stencilFront?.failOp === undefined || ds.stencilFront.failOp === "keep") &&
       (ds.stencilFront?.depthFailOp === undefined || ds.stencilFront.depthFailOp === "keep") &&
       (ds.stencilFront?.passOp === undefined || ds.stencilFront.passOp === "keep") &&
+      (ds.stencilBack?.compare === undefined || ds.stencilBack.compare === "always") &&
       (ds.stencilBack?.failOp === undefined || ds.stencilBack.failOp === "keep") &&
       (ds.stencilBack?.depthFailOp === undefined || ds.stencilBack.depthFailOp === "keep") &&
       (ds.stencilBack?.passOp === undefined || ds.stencilBack.passOp === "keep") &&
       (ds.stencilReadMask === undefined || ds.stencilReadMask === 0xFFFFFFFF) &&
       (ds.stencilWriteMask === undefined || ds.stencilWriteMask === 0xFFFFFFFF)
     );
+  }
+
+  /**
+   * Validate that fragment shader frag_depth usage is consistent with depth/stencil state.
+   * When a fragment shader writes @builtin(frag_depth), the pipeline must have a depth/stencil
+   * state with a format that includes depth aspect.
+   */
+  private validateFragDepth(descriptor: GPURenderPipelineDescriptor): GPUValidationError | null {
+    const fragModule = descriptor.fragment?.module as unknown as { hasFragDepth?: boolean } | undefined;
+    if (!fragModule?.hasFragDepth) return null;
+
+    const ds = descriptor.depthStencil;
+    if (!ds) {
+      return new GPUValidationError(
+        `Fragment shader writes frag_depth, but no depth/stencil state is provided`
+      );
+    }
+    if (!GPUDeviceImpl.DEPTH_FORMATS.has(ds.format)) {
+      return new GPUValidationError(
+        `Fragment shader writes frag_depth, but format "${ds.format}" has no depth aspect`
+      );
+    }
+    return null;
   }
 
   createTexture(descriptor: GPUTextureDescriptor): GPUTexture {
@@ -949,6 +985,9 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     // Detect immediate data size for validation
     const immediateDataSize = detectImmediateSize(code);
 
+    // Detect frag_depth usage (requires depth/stencil state with depth aspect)
+    const hasFragDepth = code.includes("frag_depth");
+
     // Allocate null-terminated code string
     const codeBytes = new TextEncoder().encode(code + "\0");
     shaderBuffers.push(codeBytes);
@@ -984,7 +1023,7 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     }
 
     const { GPUShaderModuleImpl } = require("./shader-module");
-    return new GPUShaderModuleImpl(moduleHandle, this._instance, descriptor.label, entryPoints, immediateDataSize) as unknown as GPUShaderModule;
+    return new GPUShaderModuleImpl(moduleHandle, this._instance, descriptor.label, entryPoints, immediateDataSize, hasFragDepth) as unknown as GPUShaderModule;
   }
 
   createComputePipeline(descriptor: GPUComputePipelineDescriptor): GPUComputePipeline {
@@ -1406,6 +1445,15 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     // Total: 72 bytes
 
     let depthStencilStatePtr = 0;
+
+    // Validate frag_depth usage vs depth/stencil state
+    const fragDepthErr = this.validateFragDepth(descriptor);
+    if (fragDepthErr) {
+      this.captureError(fragDepthErr);
+      const { GPURenderPipelineImpl } = require("./pipeline");
+      return new GPURenderPipelineImpl(0 as Pointer, descriptor.label) as unknown as GPURenderPipeline;
+    }
+
     if (descriptor.depthStencil) {
       const ds = descriptor.depthStencil;
 
@@ -1554,6 +1602,9 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
       const dsErr = this.validateDepthStencilState(descriptor.depthStencil, descriptor.primitive?.topology);
       if (dsErr) return Promise.reject(new GPUPipelineError(dsErr.message, { reason: "validation" }));
     }
+    // Validate frag_depth usage vs depth/stencil state
+    const fragDepthErr = this.validateFragDepth(descriptor);
+    if (fragDepthErr) return Promise.reject(new GPUPipelineError(fragDepthErr.message, { reason: "validation" }));
     // For render pipeline async, we use the sync version wrapped in a microtask
     // since the full async implementation would require duplicating all the
     // complex descriptor encoding. This still provides the async API contract.
