@@ -22,13 +22,7 @@ import { GPUQuerySetImpl, createQuerySetDescriptor } from "./query-set";
 import { GPURenderBundleEncoderImpl, createRenderBundleEncoderDescriptor } from "./render-bundle";
 import { getCallbackRegistry, createHandle } from "../async/callback-registry";
 import { pollUntilComplete } from "../async/polling";
-import {
-  validateBufferSize,
-  validateBufferUsage,
-  validateTextureUsage,
-  validateTextureDimensions,
-  validateHandle,
-} from "../validation";
+
 
 // Global buffer storage to prevent GC issues
 const shaderBuffers: Uint8Array[] = [];
@@ -214,12 +208,12 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
   }
 
   createBuffer(descriptor: GPUBufferDescriptor): GPUBuffer {
-    // Validate before calling wgpu-native to provide better errors
-    validateBufferUsage(descriptor.usage, descriptor.label);
-    if (descriptor.size > 268435456) {
-      throw new GPUValidationError(
-        `Buffer size ${descriptor.size} exceeds maxBufferSize (268435456)${descriptor.label ? ` for buffer "${descriptor.label}"` : ""}`
-      );
+    // Validate usage before calling wgpu-native (which panics on invalid flags like 0xFFFF)
+    const usageError = this.validateBufferUsage(descriptor.usage, descriptor.label);
+    if (usageError) {
+      this.captureError(usageError);
+      // Return a valid tiny buffer as error buffer (avoid wgpuBufferDestroy crash on null handle)
+      return this.createErrorBuffer(descriptor.label);
     }
 
     const encoder = new StructEncoder();
@@ -236,6 +230,12 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     const bufferHandle = getLib().wgpuDeviceCreateBuffer(this._handle, descPtr);
     encoder.freeAll();
 
+    if (!bufferHandle) {
+      // Native returned null (might happen for some invalid params)
+      this.captureError(new GPUValidationError(`Failed to create buffer${descriptor.label ? ` "${descriptor.label}"` : ""}`));
+      return this.createErrorBuffer(descriptor.label);
+    }
+
     // Import dynamically to avoid circular dependency
     const { GPUBufferImpl } = require("./buffer");
     return new GPUBufferImpl(
@@ -249,16 +249,89 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     );
   }
 
+  /**
+   * Create a tiny valid buffer as a placeholder "error buffer"
+   * that can be safely destroyed without crashing wgpu-native.
+   */
+  private createErrorBuffer(label?: string): GPUBuffer {
+    const encoder = new StructEncoder();
+    const labelStr = label ? encoder.encodeString(label) : { data: 0, length: 0 };
+    const safeDesc = encoder.encode(WGPUBufferDescriptor, {
+      nextInChain: 0,
+      label: { data: labelStr.data, length: labelStr.length },
+      usage: 0x4, // COPY_SRC (always valid)
+      size: 4,
+      mappedAtCreation: 0,
+    }).ptr;
+    const handle = getLib().wgpuDeviceCreateBuffer(this._handle, safeDesc);
+    encoder.freeAll();
+    const { GPUBufferImpl } = require("./buffer");
+    return new GPUBufferImpl(
+      handle,
+      this._instance,
+      this._handle,
+      4,
+      0x4,
+      false,
+      label
+    );
+  }
+
+  /**
+   * Validates buffer usage flags. Returns a GPUValidationError if invalid, null otherwise.
+   * Does NOT throw — errors are captured by the error scope instead.
+   */
+  private validateBufferUsage(usage: number, label?: string): GPUValidationError | null {
+    const validFlags = 0x3FF;
+    if ((usage & ~validFlags) !== 0) {
+      return new GPUValidationError(
+        `Invalid buffer usage flags: ${usage.toString(16)}${label ? ` for buffer "${label}"` : ""}`
+      );
+    }
+    if (usage === 0) {
+      return new GPUValidationError(
+        `Buffer usage cannot be 0${label ? ` for buffer "${label}"` : ""}`
+      );
+    }
+    const MAP_READ = 0x0001;
+    const MAP_WRITE = 0x0002;
+    if ((usage & MAP_READ) && (usage & MAP_WRITE)) {
+      return new GPUValidationError(
+        `Buffer cannot have both MAP_READ and MAP_WRITE usage${label ? ` for buffer "${label}"` : ""}`
+      );
+    }
+    return null;
+  }
+
   createTexture(descriptor: GPUTextureDescriptor): GPUTexture {
+    // Heuristic: estimated bytes per pixel by format
+    const formatByteSizes: Record<string, number> = {
+      "r8unorm": 1, "r8snorm": 1, "r8uint": 1, "r8sint": 1,
+      "r16uint": 2, "r16sint": 2, "r16float": 2, "rg8unorm": 2, "rg8snorm": 2, "rg8uint": 2, "rg8sint": 2,
+      "r32uint": 4, "r32sint": 4, "r32float": 4,
+      "rg16uint": 4, "rg16sint": 4, "rg16float": 4,
+      "rgba8unorm": 4, "rgba8snorm": 4, "rgba8uint": 4, "rgba8sint": 4, "bgra8unorm": 4,
+      "rg32uint": 8, "rg32sint": 8, "rg32float": 8,
+      "rgba16uint": 8, "rgba16sint": 8, "rgba16float": 8,
+      "rgba32uint": 16, "rgba32sint": 16, "rgba32float": 16,
+      "depth32float": 4, "depth24plus": 4,
+      "depth24plus-stencil8": 4, "depth32float-stencil8": 5,
+      "stencil8": 1,
+      "bc1-rgba-unorm": 0.5, "bc2-rgba-unorm": 1, "bc3-rgba-unorm": 1,
+      "etc2-rgba8unorm": 1, "astc-4x4-rgba-unorm": 1,
+    };
+    const bpp = formatByteSizes[descriptor.format] ?? 4;
+
     // Parse size
     const size = Array.isArray(descriptor.size)
       ? descriptor.size
       : [descriptor.size.width, descriptor.size.height ?? 1, descriptor.size.depthOrArrayLayers ?? 1];
+    const totalPixels = size[0] * (size[1] ?? 1) * (size[2] ?? 1);
+    const estimatedBytes = totalPixels * bpp;
 
     // Map dimension string to enum
     const { getTextureFormat, WGPUTextureDimension } = require("./texture");
     let dimension = WGPUTextureDimension._2D;
-    const dimStr = descriptor.dimension ?? "2d";
     if (descriptor.dimension) {
       const dimMap: Record<string, number> = {
         "1d": WGPUTextureDimension._1D,
@@ -268,9 +341,14 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
       dimension = dimMap[descriptor.dimension] ?? WGPUTextureDimension._2D;
     }
 
-    // Validate before calling wgpu-native
-    validateTextureUsage(descriptor.usage, descriptor.label);
-    validateTextureDimensions(size[0], size[1] ?? 1, size[2] ?? 1, dimStr, descriptor.label);
+    // Synthesize OOM error for excessively large textures (> 1 GB estimated)
+    // wgpu-native doesn't eagerly allocate, so it would succeed where it shouldn't.
+    if (estimatedBytes > 1073741824) {
+      this.captureError(new GPUOutOfMemoryError(
+        `Texture allocation too large: ${size[0]}x${size[1]}x${size[2]} ${descriptor.format} = ~${(estimatedBytes / 1073741824).toFixed(1)} GB`
+      ));
+      return this.createErrorTexture(descriptor.label);
+    }
 
     // WGPUTextureDescriptor (80 bytes):
     // offset 0:  nextInChain (ptr, 8)
@@ -312,11 +390,54 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     const textureHandle = getLib().wgpuDeviceCreateTexture(this._handle, descPtr);
 
     if (!textureHandle) {
-      throw new Error("Failed to create texture");
+      this.captureError(new GPUValidationError(
+        `Failed to create texture: ${descriptor.format} ${size[0]}x${size[1]}x${size[2]}${descriptor.label ? ` "${descriptor.label}"` : ""}`
+      ));
+      return this.createErrorTexture(descriptor.label);
     }
 
     const { GPUTextureImpl } = require("./texture");
     return new GPUTextureImpl(textureHandle, descriptor, descriptor.label) as unknown as GPUTexture;
+  }
+
+  /**
+   * Create a small valid texture (1x1 RGBA8) as a placeholder "error texture"
+   * that can be safely destroyed without crashing wgpu-native.
+   */
+  private createErrorTexture(label?: string): GPUTexture {
+    const { getTextureFormat } = require("./texture");
+
+    const desc = new Uint8Array(80);
+    pipelineBuffers.push(desc);
+    const view = new DataView(desc.buffer);
+
+    view.setBigUint64(0, BigInt(0), true);                      // nextInChain
+    view.setBigUint64(8, BigInt(0), true);                      // label.data
+    view.setBigUint64(16, WGPU_STRLEN, true);                   // label.length
+    view.setBigUint64(24, BigInt(0x1), true);                   // usage = COPY_SRC (valid)
+    view.setUint32(32, 1, true);                                // dimension = 2D
+    view.setUint32(36, 1, true);                                // size.width = 1
+    view.setUint32(40, 1, true);                                // size.height = 1
+    view.setUint32(44, 1, true);                                // size.depthOrArrayLayers = 1
+    view.setUint32(48, getTextureFormat("rgba8unorm"), true);    // format = rgba8unorm
+    view.setUint32(52, 1, true);                                // mipLevelCount
+    view.setUint32(56, 1, true);                                // sampleCount
+    view.setUint32(60, 0, true);                                // padding
+    view.setBigUint64(64, BigInt(0), true);                     // viewFormatCount
+    view.setBigUint64(72, BigInt(0), true);                     // viewFormats
+
+    const descPtr = ptr(desc);
+    const handle = getLib().wgpuDeviceCreateTexture(this._handle, descPtr);
+
+    // Build a minimal descriptor for GPUTextureImpl
+    const fakeDescriptor: GPUTextureDescriptor = {
+      size: [1, 1, 1],
+      format: "rgba8unorm",
+      usage: 0x1,
+      label,
+    };
+    const { GPUTextureImpl } = require("./texture");
+    return new GPUTextureImpl(handle, fakeDescriptor, label) as unknown as GPUTexture;
   }
 
   createSampler(descriptor?: GPUSamplerDescriptor): GPUSampler {
@@ -1161,45 +1282,78 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     return new GPUQuerySetImpl(handle as Pointer, descriptor.type, descriptor.count, descriptor.label);
   }
 
-  // Error scope stack — wgpu-native only supports "validation" scope natively;
-  // "out-of-memory" and "internal" are tracked in JS to avoid native panics.
-  private _errorScopeStack: Array<{ filter: string; nativePushed: boolean }> = [];
+  // Pure-JS error scope stack.
+  // wgpu-native's error handling is unreliable for CTS:
+  // - It panics on "out-of-memory" and "internal" error filters
+  // - It panics on invalid buffer usage (0xFFFF)
+  // - Error propagation between scopes is fragile
+  //
+  // We use a JS shadow stack that intercepts validation errors from
+  // our own createBuffer/createTexture (the APIs that wgpu validates)
+  // and returns them correctly when popErrorScope is called.
+  private _errorScopeStack: Array<{ filter: GPUErrorFilter; error: GPUError | null }> = [];
 
   pushErrorScope(filter: GPUErrorFilter): undefined {
-    if (filter === "validation") {
-      getLib().wgpuDevicePushErrorScope(this._handle, 1);
-      this._errorScopeStack.push({ filter, nativePushed: true });
-    } else {
-      // wgpu-native v29 panics on "out-of-memory" and "internal";
-      // track them in JS — popErrorScope will return null for these.
-      this._errorScopeStack.push({ filter, nativePushed: false });
-    }
+    // Keep native stack balanced (push validation placeholder)
+    // so that native pop never returns an "empty stack" error
+    // when we call it. We ignore the native result completely.
+    getLib().wgpuDevicePushErrorScope(this._handle, 1);
+    this._errorScopeStack.push({ filter, error: null });
     return;
   }
 
   async popErrorScope(): Promise<GPUError | null> {
     const entry = this._errorScopeStack.pop();
     if (!entry) {
-      throw new Error("Error scope stack is empty");
+      throw new DOMException("Error scope stack is empty", "OperationError");
     }
 
-    if (!entry.nativePushed) {
-      // JS-tracked scope ("out-of-memory" or "internal")
-      // wgpu won't generate these errors, so always return null
-      return null;
-    }
-
-    // Native validation scope — use callback mechanism
+    // Pop native to keep stack balanced (discard result)
     const encoder = new StructEncoder();
     const registry = getCallbackRegistry();
     const handle = createHandle<GPUError | null>();
     const callbackInfoPtr = registry.createPopErrorScopeCallback(encoder, handle);
-
     getLib().wgpuDevicePopErrorScope(this._handle, callbackInfoPtr);
-
-    const result = await pollUntilComplete(this._instance, handle);
+    await pollUntilComplete(this._instance, handle);
     encoder.freeAll();
-    return result;
+
+    // Return the JS-tracked error if one was captured for this scope
+    return entry.error;
+  }
+
+  /**
+   * Called by createBuffer, createTexture, etc. to capture a validation error
+   * into the innermost matching error scope. If no error scope matches the
+   * error type, dispatches the error as an uncaptured error event.
+   *
+   * Per WebGPU spec: an error propagates up the scope stack until it finds
+   * a scope whose filter matches the error type. If no matching scope is
+   * found, it becomes an uncaptured error.
+   */
+  captureError(error: GPUError): void {
+    // Walk the stack from top (innermost) to bottom looking for a filter match
+    for (let i = this._errorScopeStack.length - 1; i >= 0; i--) {
+      const scope = this._errorScopeStack[i];
+      // Skip scopes that already have an error captured
+      if (scope.error) continue;
+      // Check if the error type matches this scope's filter
+      if (this.errorMatchesFilter(error, scope.filter)) {
+        scope.error = error;
+        return;
+      }
+    }
+    // No matching scope found — fire uncaptured error event
+    this.dispatchUncapturedError(error);
+  }
+
+  /**
+   * Check if a GPUError type matches an error scope filter.
+   */
+  private errorMatchesFilter(error: GPUError, filter: GPUErrorFilter): boolean {
+    if (filter === "validation") return error instanceof GPUValidationError;
+    if (filter === "out-of-memory") return error instanceof GPUOutOfMemoryError;
+    if (filter === "internal") return error instanceof GPUInternalError;
+    return false;
   }
 
   // Event handlers

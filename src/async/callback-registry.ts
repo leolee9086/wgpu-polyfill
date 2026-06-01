@@ -137,7 +137,7 @@ export class CallbackRegistry {
           const msg = messageLength > 0 ? memory.readString(messageData, messageLength) : "";
           handle.result = this.makeGPUError(errorType, msg);
         } else if (status === 3) {
-          handle.error = new Error("Error scope stack is empty");
+          handle.error = new DOMException("Error scope stack is empty", "OperationError");
         } else {
           handle.error = new Error(`Failed to pop error scope (status ${status})`);
         }
