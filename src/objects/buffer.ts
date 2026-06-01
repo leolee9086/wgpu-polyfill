@@ -96,7 +96,7 @@ export class GPUBufferImpl extends GPUObjectBase implements GPUBuffer {
       const handle = createHandle<void>();
       const callbackInfoPtr = registry.createBufferMapCallback(encoder, handle);
 
-      getLib().wgpuBufferMapAsync(this._handle, mode, 0, this._size, callbackInfoPtr, 0);
+      getLib().wgpuBufferMapAsync(this._handle, mode, mapOffset, mapSize, callbackInfoPtr);
 
       await pollUntilComplete(this._instance, handle);
 

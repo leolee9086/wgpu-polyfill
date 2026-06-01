@@ -174,29 +174,32 @@ export class GPUCommandEncoderImpl extends GPUObjectBase implements GPUCommandEn
     const colorAttachmentsPtr = ptr(colorAttachmentsBuffer) as unknown as number;
 
     // Encode depth/stencil attachment if present
-    // WGPURenderPassDepthStencilAttachment (40 bytes):
-    // offset 0:  view (ptr, 8)
-    // offset 8:  depthLoadOp (u32, 4)
-    // offset 12: depthStoreOp (u32, 4)
-    // offset 16: depthClearValue (f32, 4)
-    // offset 20: depthReadOnly (u32, 4)
-    // offset 24: stencilLoadOp (u32, 4)
-    // offset 28: stencilStoreOp (u32, 4)
-    // offset 32: stencilClearValue (u32, 4)
-    // offset 36: stencilReadOnly (u32, 4)
-    // Total: 40 bytes
+    // WGPURenderPassDepthStencilAttachment (48 bytes in v29):
+    // offset 0:  nextInChain (ptr, 8) — NEW in v29!
+    // offset 8:  view (ptr, 8)
+    // offset 16: depthLoadOp (u32, 4)
+    // offset 20: depthStoreOp (u32, 4)
+    // offset 24: depthClearValue (f32, 4)
+    // offset 28: depthReadOnly (u32, 4)
+    // offset 32: stencilLoadOp (u32, 4)
+    // offset 36: stencilStoreOp (u32, 4)
+    // offset 40: stencilClearValue (u32, 4)
+    // offset 44: stencilReadOnly (u32, 4)
+    // Total: 48 bytes
 
     let depthStencilAttachmentPtr = 0;
     if (descriptor.depthStencilAttachment) {
       const dsAttachment = descriptor.depthStencilAttachment;
-      const dsBuffer = new Uint8Array(40);
+      const dsBuffer = new Uint8Array(48);
       encoderBuffers.push(dsBuffer);
       const dsView = new DataView(dsBuffer.buffer);
+
+      dsView.setBigUint64(0, BigInt(0), true); // nextInChain = null
 
       const dsTextureViewHandle = dsAttachment.view
         ? (dsAttachment.view as unknown as { handle: Pointer }).handle
         : 0;
-      dsView.setBigUint64(0, BigInt(dsTextureViewHandle as unknown as number), true);
+      dsView.setBigUint64(8, BigInt(dsTextureViewHandle as unknown as number), true);
 
       // Map load/store ops for depth
       const loadOpMap: Record<string, number> = {
@@ -209,22 +212,22 @@ export class GPUCommandEncoderImpl extends GPUObjectBase implements GPUCommandEn
       };
 
       // depthLoadOp - use Undefined (0) if not specified
-      dsView.setUint32(8, dsAttachment.depthLoadOp ? loadOpMap[dsAttachment.depthLoadOp] ?? 0 : 0, true);
+      dsView.setUint32(16, dsAttachment.depthLoadOp ? loadOpMap[dsAttachment.depthLoadOp] ?? 0 : 0, true);
       // depthStoreOp - use Undefined (0) if not specified
-      dsView.setUint32(12, dsAttachment.depthStoreOp ? storeOpMap[dsAttachment.depthStoreOp] ?? 0 : 0, true);
+      dsView.setUint32(20, dsAttachment.depthStoreOp ? storeOpMap[dsAttachment.depthStoreOp] ?? 0 : 0, true);
       // depthClearValue
-      dsView.setFloat32(16, dsAttachment.depthClearValue ?? 1.0, true);
+      dsView.setFloat32(24, dsAttachment.depthClearValue ?? 1.0, true);
       // depthReadOnly
-      dsView.setUint32(20, dsAttachment.depthReadOnly ? 1 : 0, true);
+      dsView.setUint32(28, dsAttachment.depthReadOnly ? 1 : 0, true);
 
       // stencilLoadOp - use Undefined (0) if not specified
-      dsView.setUint32(24, dsAttachment.stencilLoadOp ? loadOpMap[dsAttachment.stencilLoadOp] ?? 0 : 0, true);
+      dsView.setUint32(32, dsAttachment.stencilLoadOp ? loadOpMap[dsAttachment.stencilLoadOp] ?? 0 : 0, true);
       // stencilStoreOp - use Undefined (0) if not specified
-      dsView.setUint32(28, dsAttachment.stencilStoreOp ? storeOpMap[dsAttachment.stencilStoreOp] ?? 0 : 0, true);
+      dsView.setUint32(36, dsAttachment.stencilStoreOp ? storeOpMap[dsAttachment.stencilStoreOp] ?? 0 : 0, true);
       // stencilClearValue
-      dsView.setUint32(32, dsAttachment.stencilClearValue ?? 0, true);
+      dsView.setUint32(40, dsAttachment.stencilClearValue ?? 0, true);
       // stencilReadOnly
-      dsView.setUint32(36, dsAttachment.stencilReadOnly ? 1 : 0, true);
+      dsView.setUint32(44, dsAttachment.stencilReadOnly ? 1 : 0, true);
 
       depthStencilAttachmentPtr = ptr(dsBuffer) as unknown as number;
     }

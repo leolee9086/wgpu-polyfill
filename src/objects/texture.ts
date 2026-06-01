@@ -341,7 +341,7 @@ export class GPUTextureImpl extends GPUObjectBase implements GPUTexture {
   }
 
   createView(descriptor?: GPUTextureViewDescriptor): GPUTextureView {
-    // WGPUTextureViewDescriptor (48 bytes):
+    // WGPUTextureViewDescriptor (64 bytes):
     // offset 0:  nextInChain (ptr, 8)
     // offset 8:  label.data (ptr, 8)
     // offset 16: label.length (size_t, 8)
@@ -352,10 +352,11 @@ export class GPUTextureImpl extends GPUObjectBase implements GPUTexture {
     // offset 40: baseArrayLayer (u32, 4)
     // offset 44: arrayLayerCount (u32, 4)
     // offset 48: aspect (u32, 4)
-    // offset 52: usage (u32, 4)
-    // Total: 56 bytes
+    // offset 52: padding (4) — align usage to 8
+    // offset 56: usage (u64, 8) — WGPUTextureUsage = WGPUFlags = uint64_t!
+    // Total: 64 bytes
 
-    const desc = new Uint8Array(56);
+    const desc = new Uint8Array(64);
     textureBuffers.push(desc);
     const view = new DataView(desc.buffer);
 
@@ -397,7 +398,9 @@ export class GPUTextureImpl extends GPUObjectBase implements GPUTexture {
       aspect = aspectMap[descriptor.aspect] ?? WGPUTextureAspect.All;
     }
     view.setUint32(48, aspect, true);
-    view.setUint32(52, 0, true); // usage: let wgpu-native infer from texture
+    // offset 52 is padding
+    // usage at offset 56 — let wgpu-native infer from texture by setting to 0
+    view.setBigUint64(56, BigInt(0), true);
 
     const descPtr = ptr(desc);
     const viewHandle = getLib().wgpuTextureCreateView(this._handle, descPtr);

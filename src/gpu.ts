@@ -2,6 +2,7 @@
  * GPU implementation - navigator.gpu entry point
  */
 
+import { ptr } from "bun:ffi";
 import { GPUAdapterImpl } from "./objects/adapter";
 import { getLib, type Pointer } from "./ffi";
 import { StructEncoder } from "./structs/encoder";
