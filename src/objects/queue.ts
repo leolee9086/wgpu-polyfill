@@ -5,7 +5,7 @@
 import { GPUObjectBase } from "./base";
 import { getLib, memory, type Pointer } from "../ffi";
 import { StructEncoder } from "../structs/encoder";
-import { getCallbackRegistry } from "../async/callback-registry";
+import { getCallbackRegistry, createHandle } from "../async/callback-registry";
 import { pollUntilComplete } from "../async/polling";
 import { ptr } from "bun:ffi";
 
@@ -58,11 +58,11 @@ export class GPUQueueImpl extends GPUObjectBase implements GPUQueue {
   async onSubmittedWorkDone(): Promise<undefined> {
     const encoder = new StructEncoder();
     const registry = getCallbackRegistry();
-
-    const { callbackInfoPtr, promise } = registry.createQueueWorkDoneCallback(encoder);
+    const handle = createHandle<void>();
+    const callbackInfoPtr = registry.createQueueWorkDoneCallback(encoder, handle);
     getLib().wgpuQueueOnSubmittedWorkDone(this._handle, callbackInfoPtr);
 
-    await pollUntilComplete(this._instance, promise);
+    await pollUntilComplete(this._instance, handle);
     encoder.freeAll();
     return;
   }

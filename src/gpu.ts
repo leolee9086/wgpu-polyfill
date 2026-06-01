@@ -5,7 +5,7 @@
 import { GPUAdapterImpl } from "./objects/adapter";
 import { getLib, type Pointer } from "./ffi";
 import { StructEncoder } from "./structs/encoder";
-import { getCallbackRegistry } from "./async/callback-registry";
+import { getCallbackRegistry, createHandle } from "./async/callback-registry";
 import { pollUntilComplete } from "./async/polling";
 import { WGPUInstanceDescriptor } from "./structs/definitions/common";
 import { WGPURequestAdapterOptions } from "./structs/definitions/adapter";
@@ -70,11 +70,12 @@ export class GPUImpl implements GPU {
         compatibleSurface: 0, // No surface for headless
       }).ptr;
 
-      const { callbackInfoPtr, promise } = registry.createAdapterCallback(encoder);
+      const handle = createHandle<Pointer>();
+      const callbackInfoPtr = registry.createAdapterCallback(encoder, handle);
 
       getLib().wgpuInstanceRequestAdapter(this._instance, optionsPtr, callbackInfoPtr);
 
-      const adapterHandle = await pollUntilComplete(this._instance, promise);
+      const adapterHandle = await pollUntilComplete(this._instance, handle);
 
       return new GPUAdapterImpl(adapterHandle, this._instance) as unknown as GPUAdapter;
     } catch (error) {

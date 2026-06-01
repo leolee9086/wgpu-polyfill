@@ -6,7 +6,7 @@ import { toArrayBuffer } from "bun:ffi";
 import { GPUObjectBase } from "./base";
 import { getLib, type Pointer } from "../ffi";
 import { StructEncoder } from "../structs/encoder";
-import { getCallbackRegistry } from "../async/callback-registry";
+import { getCallbackRegistry, createHandle } from "../async/callback-registry";
 import { pollUntilComplete } from "../async/polling";
 import { WGPUMapMode } from "../ffi/types";
 import { GPUMapMode } from "../index";
@@ -93,22 +93,12 @@ export class GPUBufferImpl extends GPUObjectBase implements GPUBuffer {
     const registry = getCallbackRegistry();
 
     try {
-      const { callbackInfoPtr, promise } = registry.createBufferMapCallback(encoder);
+      const handle = createHandle<void>();
+      const callbackInfoPtr = registry.createBufferMapCallback(encoder, handle);
 
-      // Convert JS map mode to native
-      let nativeMode = 0;
-      if (mode & GPUMapMode.READ) nativeMode |= WGPUMapMode.Read;
-      if (mode & GPUMapMode.WRITE) nativeMode |= WGPUMapMode.Write;
+      getLib().wgpuBufferMapAsync(this._handle, mode, 0, this._size, callbackInfoPtr, 0);
 
-      getLib().wgpuBufferMapAsync(
-        this._handle,
-        nativeMode,
-        Number(mapOffset),
-        Number(mapSize),
-        callbackInfoPtr
-      );
-
-      await pollUntilComplete(this._instance, promise);
+      await pollUntilComplete(this._instance, handle);
 
       this._mapState = "mapped";
     } catch (error) {

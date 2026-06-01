@@ -391,7 +391,7 @@ export class GPUTextureImpl extends GPUObjectBase implements GPUTexture {
       aspect = aspectMap[descriptor.aspect] ?? WGPUTextureAspect.All;
     }
     view.setUint32(48, aspect, true);
-    view.setUint32(52, this._usage, true); // usage (inherit from texture)
+    view.setUint32(52, 0, true); // usage: let wgpu-native infer from texture
 
     const descPtr = ptr(desc);
     const viewHandle = getLib().wgpuTextureCreateView(this._handle, descPtr);

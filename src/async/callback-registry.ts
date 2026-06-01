@@ -1,8 +1,13 @@
 /**
- * Callback registry - converts C callbacks to JavaScript Promises
+ * Callback registry - converts C callbacks to JavaScript completion handles.
+ *
+ * Uses a polling-friendly completion handle pattern:
+ * - JSCallback sets a synchronous `done` flag + `result`/`error`
+ * - `pollUntilComplete` checks the flag directly (no Promise.resolve issue in Bun)
+ * - Promise wrapping is done at the `pollUntilComplete` level for API convenience
  */
 
-import { JSCallback, ptr } from "bun:ffi";
+import { JSCallback } from "bun:ffi";
 import { memory, type Pointer } from "../ffi";
 import { StructEncoder } from "../structs/encoder";
 import {
@@ -21,586 +26,241 @@ import {
   WGPURequestDeviceStatus,
   WGPUBufferMapAsyncStatus,
   WGPUErrorType,
-  WGPUPopErrorScopeStatus,
   WGPUCreatePipelineAsyncStatus,
   WGPUCompilationInfoRequestStatus,
   WGPUCompilationMessageType,
 } from "../ffi/types";
 
-interface PendingCallback<T> {
-  resolve: (value: T) => void;
-  reject: (error: Error) => void;
-  jsCallback: JSCallback;
+export interface CompletionHandle<T> {
+  done: boolean;
+  result: T | undefined;
+  error: Error | undefined;
+}
+
+export function createHandle<T>(): CompletionHandle<T> {
+  return { done: false, result: undefined, error: undefined };
 }
 
 /**
- * Manages callback registration and Promise resolution
+ * Manages callback registration
  */
 export class CallbackRegistry {
-  private pending = new Map<number, PendingCallback<unknown>>();
-  private nextId = 1;
 
-  /**
-   * Create a callback for adapter request
-   * Returns the encoded callback info struct pointer and a promise
-   */
-  createAdapterCallback(encoder: StructEncoder): {
-    callbackInfoPtr: Pointer;
-    promise: Promise<Pointer>;
-  } {
-    const id = this.nextId++;
-
+  createAdapterCallback(encoder: StructEncoder, handle: CompletionHandle<Pointer>): Pointer {
     const jsCallback = new JSCallback(
-      (
-        status: number,
-        adapter: Pointer,
-        messageData: Pointer,
-        messageLength: number,
-        userdata1: Pointer,
-        _userdata2: Pointer
-      ) => {
-        const pendingId = Number(userdata1);
-        const pending = this.pending.get(pendingId);
-        if (!pending) return;
-
-        this.pending.delete(pendingId);
-
+      (status: number, adapter: Pointer, messageData: Pointer, messageLength: number) => {
         if (status === WGPURequestAdapterStatus.Success) {
-          pending.resolve(adapter);
+          handle.result = adapter;
         } else {
-          const message = messageLength > 0 ? memory.readString(messageData, messageLength) : "Unknown error";
-          pending.reject(new Error(`Failed to request adapter (status ${status}): ${message}`));
+          handle.error = new Error(
+            `Failed to request adapter: ${messageLength > 0 ? memory.readString(messageData, messageLength) : "Unknown"}`
+          );
         }
-
-        // Clean up the callback after use
-        setTimeout(() => pending.jsCallback.close(), 0);
+        handle.done = true;
+        setTimeout(() => jsCallback.close(), 0);
       },
-      {
-        args: ["u32", "ptr", "ptr", "usize", "ptr", "ptr"],
-        returns: "void",
-      }
+      { args: ["u32", "ptr", "ptr", "usize"], returns: "void" }
     );
 
-    const promise = new Promise<Pointer>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, jsCallback } as PendingCallback<unknown>);
-    });
-
-    const callbackInfoPtr = encoder.encode(WGPURequestAdapterCallbackInfo, {
-      nextInChain: 0,
-      mode: WGPUCallbackMode.AllowProcessEvents,
-      callback: jsCallback.ptr,
-      userdata1: id,
-      userdata2: 0,
+    return encoder.encode(WGPURequestAdapterCallbackInfo, {
+      nextInChain: 0, mode: WGPUCallbackMode.WaitAnyOnly,
+      callback: jsCallback.ptr, userdata1: 0, userdata2: 0,
     }).ptr;
-
-    return { callbackInfoPtr, promise };
   }
 
-  /**
-   * Create a callback for device request
-   */
-  createDeviceCallback(encoder: StructEncoder): {
-    callbackInfoPtr: Pointer;
-    promise: Promise<Pointer>;
-  } {
-    const id = this.nextId++;
-
+  createDeviceCallback(encoder: StructEncoder, handle: CompletionHandle<Pointer>): Pointer {
     const jsCallback = new JSCallback(
-      (
-        status: number,
-        device: Pointer,
-        messageData: Pointer,
-        messageLength: number,
-        userdata1: Pointer,
-        _userdata2: Pointer
-      ) => {
-        const pendingId = Number(userdata1);
-        const pending = this.pending.get(pendingId);
-        if (!pending) return;
-
-        this.pending.delete(pendingId);
-
+      (status: number, device: Pointer, messageData: Pointer, messageLength: number) => {
         if (status === WGPURequestDeviceStatus.Success) {
-          pending.resolve(device);
+          handle.result = device;
         } else {
-          const message = messageLength > 0 ? memory.readString(messageData, messageLength) : "Unknown error";
-          pending.reject(new Error(`Failed to request device (status ${status}): ${message}`));
+          handle.error = new Error(
+            `Failed to request device: ${messageLength > 0 ? memory.readString(messageData, messageLength) : "Unknown"}`
+          );
         }
-
-        setTimeout(() => pending.jsCallback.close(), 0);
+        handle.done = true;
+        setTimeout(() => jsCallback.close(), 0);
       },
-      {
-        args: ["u32", "ptr", "ptr", "usize", "ptr", "ptr"],
-        returns: "void",
-      }
+      { args: ["u32", "ptr", "ptr", "usize"], returns: "void" }
     );
 
-    const promise = new Promise<Pointer>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, jsCallback } as PendingCallback<unknown>);
-    });
-
-    const callbackInfoPtr = encoder.encode(WGPURequestDeviceCallbackInfo, {
-      nextInChain: 0,
-      mode: WGPUCallbackMode.AllowProcessEvents,
-      callback: jsCallback.ptr,
-      userdata1: id,
-      userdata2: 0,
+    return encoder.encode(WGPURequestDeviceCallbackInfo, {
+      nextInChain: 0, mode: WGPUCallbackMode.WaitAnyOnly,
+      callback: jsCallback.ptr, userdata1: 0, userdata2: 0,
     }).ptr;
-
-    return { callbackInfoPtr, promise };
   }
 
-  /**
-   * Create a callback for buffer map
-   */
-  createBufferMapCallback(encoder: StructEncoder): {
-    callbackInfoPtr: Pointer;
-    promise: Promise<void>;
-  } {
-    const id = this.nextId++;
-
+  createBufferMapCallback(encoder: StructEncoder, handle: CompletionHandle<void>): Pointer {
     const jsCallback = new JSCallback(
-      (
-        status: number,
-        messageData: Pointer,
-        messageLength: number,
-        userdata1: Pointer,
-        _userdata2: Pointer
-      ) => {
-        const pendingId = Number(userdata1);
-        const pending = this.pending.get(pendingId);
-        if (!pending) return;
-
-        this.pending.delete(pendingId);
-
+      (status: number, messageData: Pointer, messageLength: number) => {
         if (status === WGPUBufferMapAsyncStatus.Success) {
-          pending.resolve(undefined);
+          handle.result = undefined;
         } else {
-          const message = messageLength > 0 ? memory.readString(messageData, messageLength) : "Unknown error";
-          pending.reject(new Error(`Failed to map buffer (status ${status}): ${message}`));
+          handle.error = new Error(
+            `Failed to map buffer: ${messageLength > 0 ? memory.readString(messageData, messageLength) : "Unknown"}`
+          );
         }
-
-        setTimeout(() => pending.jsCallback.close(), 0);
+        handle.done = true;
+        setTimeout(() => jsCallback.close(), 0);
       },
-      {
-        args: ["u32", "ptr", "usize", "ptr", "ptr"],
-        returns: "void",
-      }
+      { args: ["u32", "ptr", "usize"], returns: "void" }
     );
 
-    const promise = new Promise<void>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, jsCallback } as PendingCallback<unknown>);
-    });
-
-    const callbackInfoPtr = encoder.encode(WGPUBufferMapCallbackInfo, {
-      nextInChain: 0,
-      mode: WGPUCallbackMode.AllowProcessEvents,
-      callback: jsCallback.ptr,
-      userdata1: id,
-      userdata2: 0,
+    return encoder.encode(WGPUBufferMapCallbackInfo, {
+      nextInChain: 0, mode: WGPUCallbackMode.WaitAnyOnly,
+      callback: jsCallback.ptr, userdata1: 0, userdata2: 0,
     }).ptr;
-
-    return { callbackInfoPtr, promise };
   }
 
-  /**
-   * Create a callback for queue work done
-   */
-  createQueueWorkDoneCallback(encoder: StructEncoder): {
-    callbackInfoPtr: Pointer;
-    promise: Promise<void>;
-  } {
-    const id = this.nextId++;
-
+  createQueueWorkDoneCallback(encoder: StructEncoder, handle: CompletionHandle<void>): Pointer {
     const jsCallback = new JSCallback(
-      (status: number, userdata1: Pointer, _userdata2: Pointer) => {
-        const pendingId = Number(userdata1);
-        const pending = this.pending.get(pendingId);
-        if (!pending) return;
+      (status: number) => {
+        handle.done = true;
+        if (status !== 1) handle.error = new Error(`Queue work done failed (status ${status})`);
+        else handle.result = undefined;
+        setTimeout(() => jsCallback.close(), 0);
+      },
+      { args: ["u32"], returns: "void" }
+    );
 
-        this.pending.delete(pendingId);
+    return encoder.encode(WGPUQueueWorkDoneCallbackInfo, {
+      nextInChain: 0, mode: WGPUCallbackMode.WaitAnyOnly,
+      callback: jsCallback.ptr, userdata1: 0, userdata2: 0,
+    }).ptr;
+  }
 
-        // WGPUQueueWorkDoneStatus_Success = 1
+  createPopErrorScopeCallback(encoder: StructEncoder, handle: CompletionHandle<GPUError | null>): Pointer {
+    const jsCallback = new JSCallback(
+      (status: number, errorType: number, messageData: Pointer, messageLength: number) => {
+        // status: 1=Success, 3=EmptyStack
         if (status === 1) {
-          pending.resolve(undefined);
+          const msg = messageLength > 0 ? memory.readString(messageData, messageLength) : "";
+          handle.result = this.makeGPUError(errorType, msg);
+        } else if (status === 3) {
+          handle.error = new Error("Error scope stack is empty");
         } else {
-          pending.reject(new Error(`Queue work done failed (status ${status})`));
+          handle.error = new Error(`Failed to pop error scope (status ${status})`);
         }
-
-        setTimeout(() => pending.jsCallback.close(), 0);
+        handle.done = true;
+        setTimeout(() => jsCallback.close(), 0);
       },
-      {
-        args: ["u32", "ptr", "ptr"],
-        returns: "void",
-      }
+      { args: ["u32", "u32", "ptr", "usize"], returns: "void" }
     );
 
-    const promise = new Promise<void>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, jsCallback } as PendingCallback<unknown>);
-    });
-
-    const callbackInfoPtr = encoder.encode(WGPUQueueWorkDoneCallbackInfo, {
-      nextInChain: 0,
-      mode: WGPUCallbackMode.AllowProcessEvents,
-      callback: jsCallback.ptr,
-      userdata1: id,
-      userdata2: 0,
+    return encoder.encode(WGPUPopErrorScopeCallbackInfo, {
+      nextInChain: 0, mode: WGPUCallbackMode.WaitAnyOnly,
+      callback: jsCallback.ptr, userdata1: 0, userdata2: 0,
     }).ptr;
-
-    return { callbackInfoPtr, promise };
   }
 
-  /**
-   * Error result type for popErrorScope
-   */
-  private createGPUError(type: number, message: string): GPUError | null {
-    if (type === WGPUErrorType.NoError) {
-      return null;
-    }
-
-    const errorMessage = message || "Unknown GPU error";
-
-    if (type === WGPUErrorType.Validation) {
-      return new GPUValidationError(errorMessage);
-    } else if (type === WGPUErrorType.OutOfMemory) {
-      return new GPUOutOfMemoryError(errorMessage);
-    } else if (type === WGPUErrorType.Internal) {
-      return new GPUInternalError(errorMessage);
-    }
-
-    return new GPUValidationError(errorMessage);
-  }
-
-  /**
-   * Create a callback for popErrorScope
-   */
-  createPopErrorScopeCallback(encoder: StructEncoder): {
-    callbackInfoPtr: Pointer;
-    promise: Promise<GPUError | null>;
-  } {
-    const id = this.nextId++;
-
+  createComputePipelineAsyncCallback(encoder: StructEncoder, handle: CompletionHandle<Pointer>): Pointer {
     const jsCallback = new JSCallback(
-      (
-        status: number,
-        errorType: number,
-        messageData: Pointer,
-        messageLength: number,
-        userdata1: Pointer,
-        _userdata2: Pointer
-      ) => {
-        const pendingId = Number(userdata1);
-        const pending = this.pending.get(pendingId);
-        if (!pending) return;
-
-        this.pending.delete(pendingId);
-
-        if (status === WGPUPopErrorScopeStatus.Success) {
-          const message = messageLength > 0 ? memory.readString(messageData, messageLength) : "";
-          const error = this.createGPUError(errorType, message);
-          pending.resolve(error);
-        } else if (status === WGPUPopErrorScopeStatus.EmptyStack) {
-          pending.reject(new Error("Error scope stack is empty"));
-        } else {
-          pending.reject(new Error(`Failed to pop error scope (status ${status})`));
-        }
-
-        setTimeout(() => pending.jsCallback.close(), 0);
-      },
-      {
-        args: ["u32", "u32", "ptr", "usize", "ptr", "ptr"],
-        returns: "void",
-      }
-    );
-
-    const promise = new Promise<GPUError | null>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, jsCallback } as PendingCallback<unknown>);
-    });
-
-    const callbackInfoPtr = encoder.encode(WGPUPopErrorScopeCallbackInfo, {
-      nextInChain: 0,
-      mode: WGPUCallbackMode.AllowProcessEvents,
-      callback: jsCallback.ptr,
-      userdata1: id,
-      userdata2: 0,
-    }).ptr;
-
-    return { callbackInfoPtr, promise };
-  }
-
-  /**
-   * Create a callback for createComputePipelineAsync
-   */
-  createComputePipelineAsyncCallback(encoder: StructEncoder): {
-    callbackInfoPtr: Pointer;
-    promise: Promise<Pointer>;
-  } {
-    const id = this.nextId++;
-
-    const jsCallback = new JSCallback(
-      (
-        status: number,
-        pipeline: Pointer,
-        messageData: Pointer,
-        messageLength: number,
-        userdata1: Pointer,
-        _userdata2: Pointer
-      ) => {
-        const pendingId = Number(userdata1);
-        const pending = this.pending.get(pendingId);
-        if (!pending) return;
-
-        this.pending.delete(pendingId);
-
+      (status: number, pipeline: Pointer, messageData: Pointer, messageLength: number) => {
         if (status === WGPUCreatePipelineAsyncStatus.Success) {
-          pending.resolve(pipeline);
+          handle.result = pipeline;
         } else {
-          const message = messageLength > 0 ? memory.readString(messageData, messageLength) : "Unknown error";
-          pending.reject(new Error(`Failed to create compute pipeline (status ${status}): ${message}`));
+          handle.error = new Error(
+            `Create compute pipeline failed: ${messageLength > 0 ? memory.readString(messageData, messageLength) : "Unknown"}`
+          );
         }
-
-        setTimeout(() => pending.jsCallback.close(), 0);
+        handle.done = true;
+        setTimeout(() => jsCallback.close(), 0);
       },
-      {
-        args: ["u32", "ptr", "ptr", "usize", "ptr", "ptr"],
-        returns: "void",
-      }
+      { args: ["u32", "ptr", "ptr", "usize"], returns: "void" }
     );
 
-    const promise = new Promise<Pointer>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, jsCallback } as PendingCallback<unknown>);
-    });
-
-    const callbackInfoPtr = encoder.encode(WGPUCreateComputePipelineAsyncCallbackInfo, {
-      nextInChain: 0,
-      mode: WGPUCallbackMode.AllowProcessEvents,
-      callback: jsCallback.ptr,
-      userdata1: id,
-      userdata2: 0,
+    return encoder.encode(WGPUCreateComputePipelineAsyncCallbackInfo, {
+      nextInChain: 0, mode: WGPUCallbackMode.WaitAnyOnly,
+      callback: jsCallback.ptr, userdata1: 0, userdata2: 0,
     }).ptr;
-
-    return { callbackInfoPtr, promise };
   }
 
-  /**
-   * Create a callback for createRenderPipelineAsync
-   */
-  createRenderPipelineAsyncCallback(encoder: StructEncoder): {
-    callbackInfoPtr: Pointer;
-    promise: Promise<Pointer>;
-  } {
-    const id = this.nextId++;
-
+  createRenderPipelineAsyncCallback(encoder: StructEncoder, handle: CompletionHandle<Pointer>): Pointer {
     const jsCallback = new JSCallback(
-      (
-        status: number,
-        pipeline: Pointer,
-        messageData: Pointer,
-        messageLength: number,
-        userdata1: Pointer,
-        _userdata2: Pointer
-      ) => {
-        const pendingId = Number(userdata1);
-        const pending = this.pending.get(pendingId);
-        if (!pending) return;
-
-        this.pending.delete(pendingId);
-
+      (status: number, pipeline: Pointer, messageData: Pointer, messageLength: number) => {
         if (status === WGPUCreatePipelineAsyncStatus.Success) {
-          pending.resolve(pipeline);
+          handle.result = pipeline;
         } else {
-          const message = messageLength > 0 ? memory.readString(messageData, messageLength) : "Unknown error";
-          pending.reject(new Error(`Failed to create render pipeline (status ${status}): ${message}`));
+          handle.error = new Error(
+            `Create render pipeline failed: ${messageLength > 0 ? memory.readString(messageData, messageLength) : "Unknown"}`
+          );
         }
-
-        setTimeout(() => pending.jsCallback.close(), 0);
+        handle.done = true;
+        setTimeout(() => jsCallback.close(), 0);
       },
-      {
-        args: ["u32", "ptr", "ptr", "usize", "ptr", "ptr"],
-        returns: "void",
-      }
+      { args: ["u32", "ptr", "ptr", "usize"], returns: "void" }
     );
 
-    const promise = new Promise<Pointer>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, jsCallback } as PendingCallback<unknown>);
-    });
-
-    const callbackInfoPtr = encoder.encode(WGPUCreateRenderPipelineAsyncCallbackInfo, {
-      nextInChain: 0,
-      mode: WGPUCallbackMode.AllowProcessEvents,
-      callback: jsCallback.ptr,
-      userdata1: id,
-      userdata2: 0,
+    return encoder.encode(WGPUCreateRenderPipelineAsyncCallbackInfo, {
+      nextInChain: 0, mode: WGPUCallbackMode.WaitAnyOnly,
+      callback: jsCallback.ptr, userdata1: 0, userdata2: 0,
     }).ptr;
-
-    return { callbackInfoPtr, promise };
   }
 
-  /**
-   * Create a callback for getCompilationInfo
-   */
-  createCompilationInfoCallback(encoder: StructEncoder): {
-    callbackInfoPtr: Pointer;
-    promise: Promise<GPUCompilationInfo>;
-  } {
-    const id = this.nextId++;
-
+  createCompilationInfoCallback(encoder: StructEncoder, handle: CompletionHandle<GPUCompilationInfo>): Pointer {
     const jsCallback = new JSCallback(
-      (
-        status: number,
-        compilationInfo: Pointer,
-        userdata1: Pointer,
-        _userdata2: Pointer
-      ) => {
-        const pendingId = Number(userdata1);
-        const pending = this.pending.get(pendingId);
-        if (!pending) return;
-
-        this.pending.delete(pendingId);
-
+      (status: number, compilationInfo: Pointer) => {
+        handle.done = true;
         if (status === WGPUCompilationInfoRequestStatus.Success && compilationInfo) {
-          // Parse the WGPUCompilationInfo struct
-          const messages = this.parseCompilationInfo(compilationInfo);
-          const result: GPUCompilationInfo = {
+          handle.result = {
             __brand: "GPUCompilationInfo",
-            messages,
-          };
-          pending.resolve(result);
+            messages: this.parseCompilationInfo(compilationInfo),
+          } as GPUCompilationInfo;
         } else {
-          // Return empty compilation info on error
-          const result: GPUCompilationInfo = {
-            __brand: "GPUCompilationInfo",
-            messages: [],
-          };
-          pending.resolve(result);
+          handle.result = { __brand: "GPUCompilationInfo", messages: [] } as GPUCompilationInfo;
         }
-
-        setTimeout(() => pending.jsCallback.close(), 0);
+        setTimeout(() => jsCallback.close(), 0);
       },
-      {
-        args: ["u32", "ptr", "ptr", "ptr"],
-        returns: "void",
-      }
+      { args: ["u32", "ptr"], returns: "void" }
     );
 
-    const promise = new Promise<GPUCompilationInfo>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, jsCallback } as PendingCallback<unknown>);
-    });
-
-    const callbackInfoPtr = encoder.encode(WGPUCompilationInfoCallbackInfo, {
-      nextInChain: 0,
-      mode: WGPUCallbackMode.AllowProcessEvents,
-      callback: jsCallback.ptr,
-      userdata1: id,
-      userdata2: 0,
+    return encoder.encode(WGPUCompilationInfoCallbackInfo, {
+      nextInChain: 0, mode: WGPUCallbackMode.WaitAnyOnly,
+      callback: jsCallback.ptr, userdata1: 0, userdata2: 0,
     }).ptr;
-
-    return { callbackInfoPtr, promise };
   }
 
-  /**
-   * Parse WGPUCompilationInfo struct into GPUCompilationMessage array
-   */
+  private makeGPUError(type: number, message: string): GPUError | null {
+    if (type === WGPUErrorType.NoError) return null;
+    const m = message || "Unknown GPU error";
+    if (type === WGPUErrorType.Validation) return new GPUValidationError(m);
+    if (type === WGPUErrorType.OutOfMemory) return new GPUOutOfMemoryError(m);
+    if (type === WGPUErrorType.Internal) return new GPUInternalError(m);
+    return new GPUValidationError(m);
+  }
+
   private parseCompilationInfo(infoPtr: Pointer): GPUCompilationMessage[] {
     const messages: GPUCompilationMessage[] = [];
-
-    // WGPUCompilationInfo structure:
-    // offset 0: nextInChain (ptr, 8)
-    // offset 8: messageCount (usize, 8)
-    // offset 16: messages (ptr to array, 8)
-
-    const infoView = new DataView(
-      new Uint8Array(memory.read(infoPtr, 24)).buffer
-    );
+    const infoView = new DataView(new Uint8Array(memory.read(infoPtr, 24)).buffer);
     const messageCount = Number(infoView.getBigUint64(8, true));
     const messagesPtr = Number(infoView.getBigUint64(16, true)) as unknown as Pointer;
+    if (messageCount === 0 || !messagesPtr) return messages;
 
-    if (messageCount === 0 || !messagesPtr) {
-      return messages;
-    }
-
-    // WGPUCompilationMessage structure (approx 72 bytes):
-    // offset 0: nextInChain (ptr, 8)
-    // offset 8: message.data (ptr, 8)
-    // offset 16: message.length (usize, 8)
-    // offset 24: type (u32, 4)
-    // offset 28: padding (4)
-    // offset 32: lineNum (u64, 8)
-    // offset 40: linePos (u64, 8)
-    // offset 48: offset (u64, 8)
-    // offset 56: length (u64, 8)
-    // offset 64: utf16LinePos (u64, 8)
-    // offset 72: utf16Offset (u64, 8)
-    // offset 80: utf16Length (u64, 8)
     const MESSAGE_SIZE = 88;
-
     for (let i = 0; i < messageCount; i++) {
       const msgPtr = (Number(messagesPtr) + i * MESSAGE_SIZE) as unknown as Pointer;
-      const msgData = memory.read(msgPtr, MESSAGE_SIZE);
-      const msgView = new DataView(new Uint8Array(msgData).buffer);
-
-      const messageDataPtr = Number(msgView.getBigUint64(8, true)) as unknown as Pointer;
-      const messageLength = Number(msgView.getBigUint64(16, true));
-      const messageType = msgView.getUint32(24, true);
-      const lineNum = Number(msgView.getBigUint64(32, true));
-      const linePos = Number(msgView.getBigUint64(40, true));
-
-      let type: GPUCompilationMessageType = "info";
-      if (messageType === WGPUCompilationMessageType.Error) {
-        type = "error";
-      } else if (messageType === WGPUCompilationMessageType.Warning) {
-        type = "warning";
-      }
-
-      const messageText = messageLength > 0
-        ? memory.readString(messageDataPtr, messageLength)
-        : "";
-
+      const msgView = new DataView(new Uint8Array(memory.read(msgPtr, MESSAGE_SIZE)).buffer);
+      const msgText = memory.readString(
+        Number(msgView.getBigUint64(8, true)) as unknown as Pointer,
+        Number(msgView.getBigUint64(16, true))
+      );
+      const type = msgView.getUint32(24, true) === WGPUCompilationMessageType.Error ? "error"
+        : msgView.getUint32(24, true) === WGPUCompilationMessageType.Warning ? "warning" : "info";
       messages.push({
-        message: messageText,
-        type,
-        lineNum,
-        linePos,
+        message: msgText, type,
+        lineNum: Number(msgView.getBigUint64(32, true)),
+        linePos: Number(msgView.getBigUint64(40, true)),
         offset: Number(msgView.getBigUint64(48, true)),
         length: Number(msgView.getBigUint64(56, true)),
       } as GPUCompilationMessage);
     }
-
     return messages;
-  }
-
-  /**
-   * Check if there are pending callbacks
-   */
-  hasPending(): boolean {
-    return this.pending.size > 0;
-  }
-
-  /**
-   * Get count of pending callbacks
-   */
-  pendingCount(): number {
-    return this.pending.size;
-  }
-
-  /**
-   * Clean up all pending callbacks (for shutdown)
-   */
-  cleanup(): void {
-    for (const [, pending] of this.pending) {
-      pending.reject(new Error("Callback registry cleaned up"));
-      pending.jsCallback.close();
-    }
-    this.pending.clear();
   }
 }
 
-// Global callback registry singleton
 let globalRegistry: CallbackRegistry | null = null;
 
 export function getCallbackRegistry(): CallbackRegistry {
-  if (!globalRegistry) {
-    globalRegistry = new CallbackRegistry();
-  }
+  if (!globalRegistry) globalRegistry = new CallbackRegistry();
   return globalRegistry;
 }

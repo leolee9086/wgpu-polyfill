@@ -20,7 +20,8 @@ import { WGPUSType, WGPU_STRLEN } from "../ffi/types";
 import { ptr } from "bun:ffi";
 import { GPUQuerySetImpl, createQuerySetDescriptor } from "./query-set";
 import { GPURenderBundleEncoderImpl, createRenderBundleEncoderDescriptor } from "./render-bundle";
-import { getCallbackRegistry } from "../async/callback-registry";
+import { getCallbackRegistry, createHandle } from "../async/callback-registry";
+import { pollUntilComplete } from "../async/polling";
 import {
   validateBufferSize,
   validateBufferUsage,
@@ -1168,24 +1169,17 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     return;
   }
 
-  popErrorScope(): Promise<GPUError | null> {
+  async popErrorScope(): Promise<GPUError | null> {
     const encoder = new StructEncoder();
     const registry = getCallbackRegistry();
-    const { callbackInfoPtr, promise } = registry.createPopErrorScopeCallback(encoder);
+    const handle = createHandle<GPUError | null>();
+    const callbackInfoPtr = registry.createPopErrorScopeCallback(encoder, handle);
 
-    // Store encoder in pipeline buffers to prevent GC
-    const futureId = getLib().wgpuDevicePopErrorScope(this._handle, callbackInfoPtr);
+    getLib().wgpuDevicePopErrorScope(this._handle, callbackInfoPtr);
 
-    // Poll for completion
-    const pollForCompletion = async (): Promise<GPUError | null> => {
-      while (registry.hasPending()) {
-        getLib().wgpuInstanceProcessEvents(this._instance);
-        await new Promise((resolve) => setTimeout(resolve, 1));
-      }
-      return promise;
-    };
-
-    return pollForCompletion();
+    const result = await pollUntilComplete(this._instance, handle);
+    encoder.freeAll();
+    return result;
   }
 
   // Event handlers

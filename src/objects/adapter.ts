@@ -6,7 +6,7 @@ import { GPUObjectBase } from "./base";
 import { GPUDeviceImpl } from "./device";
 import { getLib, type Pointer } from "../ffi";
 import { StructEncoder } from "../structs/encoder";
-import { getCallbackRegistry } from "../async/callback-registry";
+import { getCallbackRegistry, createHandle } from "../async/callback-registry";
 import { pollUntilComplete } from "../async/polling";
 import { WGPUDeviceDescriptor } from "../structs/definitions/device";
 import { ptr } from "bun:ffi";
@@ -302,11 +302,12 @@ export class GPUAdapterImpl extends GPUObjectBase implements GPUAdapter {
         },
       }).ptr;
 
-      const { callbackInfoPtr, promise } = registry.createDeviceCallback(encoder);
+      const handle = createHandle<Pointer>();
+      const callbackInfoPtr = registry.createDeviceCallback(encoder, handle);
 
       getLib().wgpuAdapterRequestDevice(this._handle, descPtr, callbackInfoPtr);
 
-      const deviceHandle = await pollUntilComplete(this._instance, promise);
+      const deviceHandle = await pollUntilComplete(this._instance, handle);
 
       return new GPUDeviceImpl(deviceHandle, this._instance, descriptor?.label, this._info) as unknown as GPUDevice;
     } finally {
