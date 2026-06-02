@@ -495,15 +495,6 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
 
     const bufArr = buffers ? Array.from(buffers) : [];
 
-    // wgpu-native v29 panics on unused vertex buffer slots (holes). Reject them.
-    for (let i = 0; i < bufArr.length; i++) {
-      if (!bufArr[i]) {
-        return new GPUValidationError(
-          `Vertex buffer slot ${i} is unused (null/undefined). wgpu-native v29 does not support holes.`
-        );
-      }
-    }
-
     // Buffer count and validate non-null entries
     let nonNullCount = 0;
     for (const b of bufArr) {
@@ -626,11 +617,26 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
 
     const code = vertexModule.code;
 
+    // Check for unsupported vertex formats that would panic wgpu-native
+    const buffers = vertex.buffers ? Array.from(vertex.buffers) : [];
+    for (const b of buffers) {
+      if (b?.attributes) {
+        for (const attr of b.attributes) {
+          // unorm8x4-bgra vertex format is not supported in wgpu-native v29
+          // (panics with "invalid vertex format for vertex attribute: 41")
+          if (attr.format === "unorm8x4-bgra") {
+            return new GPUValidationError(
+              `Vertex format "${attr.format}" is not supported`
+            );
+          }
+        }
+      }
+    }
+
     // Parse only vertex INPUT locations (struct parameter fields)
     const shaderInputLocations = this.parseVertexInputLocations(code);
 
     const hasShaderInputs = shaderInputLocations.size > 0;
-    const buffers = vertex.buffers ? Array.from(vertex.buffers) : [];
     const attributes: Array<{ shaderLocation: number; format: string; buffer: GPUVertexBufferLayout }> = [];
     for (const b of buffers) {
       if (b?.attributes) {
@@ -649,13 +655,7 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     }
 
     if (!hasShaderInputs) {
-      // wgpu-native v29 panics at lib.rs:2223 when vertex attributes are provided
-      // but the vertex shader has no @location inputs. Return a validation error.
-      if (hasAttributes) {
-        return new GPUValidationError(
-          `Vertex shader has no vertex inputs (@location), but vertex state provides ${attributes.length} attributes`
-        );
-      }
+      // No shader inputs — vertex attributes are unused but valid per spec.
       return null;
     }
     if (!hasAttributes) return null;
@@ -712,15 +712,6 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
       if (shaderInfo.base !== fmtInfo.base) {
         return new GPUValidationError(
           `Vertex attribute at shaderLocation ${attr.shaderLocation} has format "${attr.format}" (base type ${fmtInfo.base}), but shader expects type "${shaderType}" (base type ${shaderInfo.base})`
-        );
-      }
-
-      // Packed formats (unorm10-10-10-2, unorm8x4-bgra) are not fully supported
-      // in wgpu-native v29 — they can cause panics at lib.rs:2223. Reject them.
-      const packedFormats = new Set(["unorm10-10-10-2", "unorm8x4-bgra"]);
-      if (packedFormats.has(attr.format)) {
-        return new GPUValidationError(
-          `Packed vertex format "${attr.format}" is not supported by this device`
         );
       }
     }
@@ -2277,13 +2268,13 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
         const buffer = buffers[i];
         const bufView = new DataView(buffersBuffer.buffer, i * 40, 40);
         if (!buffer) {
-          // Hole in array - use stepMode = Undefined (0)
+          // Hole in array — encode as empty buffer with defined stepMode per spec
           bufView.setBigUint64(0, BigInt(0), true); // nextInChain = null
-          bufView.setUint32(8, 0, true); // stepMode = Undefined
+          bufView.setUint32(8, 0x01, true); // stepMode = Vertex (not Undefined)
           bufView.setUint32(12, 0, true); // padding
-          bufView.setBigUint64(16, BigInt(0), true); // arrayStride
-          bufView.setBigUint64(24, BigInt(0), true); // attributeCount
-          bufView.setBigUint64(32, BigInt(0), true); // attributes
+          bufView.setBigUint64(16, BigInt(0), true); // arrayStride = 0
+          bufView.setBigUint64(24, BigInt(0), true); // attributeCount = 0
+          bufView.setBigUint64(32, BigInt(0), true); // attributes = null
         } else {
           bufView.setBigUint64(0, BigInt(0), true); // nextInChain = null
           bufView.setUint32(8, stepModeMap[buffer.stepMode ?? "vertex"] ?? 0x01, true);
