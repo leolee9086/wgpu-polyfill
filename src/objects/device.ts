@@ -22,7 +22,7 @@ import { GPUQuerySetImpl, createQuerySetDescriptor } from "./query-set";
 import { GPURenderBundleEncoderImpl, createRenderBundleEncoderDescriptor } from "./render-bundle";
 import { getCallbackRegistry, createHandle } from "../async/callback-registry";
 import { pollUntilComplete } from "../async/polling";
-import { parseEntryPoints, detectImmediateSize } from "../wgsl/parser";
+import { parseEntryPoints, detectImmediateSize, parseLocations, parseOverrides, parseBindings, parseStorageTextureInfo } from "../wgsl/parser";
 
 
 // Global buffer storage to prevent GC issues
@@ -587,6 +587,38 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
    * - vertex state is provided but the vertex shader has no vertex inputs
    * - shader input types don't match the vertex attribute format signing
    */
+  /**
+   * Parse vertex shader INPUT @location(N) types from WGSL source.
+   * Vertex inputs are @location fields inside a struct used as a function
+   * parameter (e.g. `fn main(input: Inputs)`), NOT the return type struct.
+   * We detect the parameter struct name and extract its fields.
+   */
+  private parseVertexInputLocations(code: string): Map<number, string> {
+    const inputs = new Map<number, string>();
+
+    // Find the struct name used as the vertex function's parameter
+    // Pattern: @vertex fn main(paramName: StructName)
+    const fnMatch = code.match(/@vertex\s+fn\s+\w+\s*\(\s*\w+\s*:\s*(\w+)\s*\)/);
+    if (!fnMatch) return inputs; // no parameter struct → no inputs
+
+    const structName = fnMatch[1];
+
+    // Find the struct definition: struct StructName { ... }
+    const structRegex = new RegExp(`struct\\s+${structName}\\s*\\{([^}]*)\\}`);
+    const structMatch = code.match(structRegex);
+    if (!structMatch) return inputs;
+
+    const structBody = structMatch[1];
+
+    // Extract @location(N) fields from the struct body
+    const locRegex = /@location\((\d+)\)\s+(?:\w+\s*:\s*)?([^,{]+)/g;
+    let m;
+    while ((m = locRegex.exec(structBody)) !== null) {
+      inputs.set(parseInt(m[1]), m[2].trim());
+    }
+    return inputs;
+  }
+
   private validateVertexShaderCompatibility(
     vertex: GPUVertexState,
   ): GPUValidationError | null {
@@ -594,25 +626,51 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     if (!vertexModule?.code) return null;
 
     const code = vertexModule.code;
-    const buffers = vertex.buffers ? Array.from(vertex.buffers) : [];
-    const hasAttributes = buffers.some(b => b?.attributes && b.attributes.length > 0);
-    if (!hasAttributes) return null;
 
-    // Check if the vertex shader source references @location — if not, it has no vertex inputs
-    // and any vertex attributes are invalid (wgpu-core panics on this mismatch).
-    if (!code.includes("@location(")) {
+    // Parse only vertex INPUT locations (struct parameter fields)
+    const shaderInputLocations = this.parseVertexInputLocations(code);
+
+    const hasShaderInputs = shaderInputLocations.size > 0;
+    const buffers = vertex.buffers ? Array.from(vertex.buffers) : [];
+    const attributes: Array<{ shaderLocation: number; format: string; buffer: GPUVertexBufferLayout }> = [];
+    for (const b of buffers) {
+      if (b?.attributes) {
+        for (const attr of b.attributes) {
+          attributes.push({ shaderLocation: attr.shaderLocation, format: attr.format, buffer: b });
+        }
+      }
+    }
+    const hasAttributes = attributes.length > 0;
+
+    // If shader has inputs but no attributes → error (each shader input needs a matching attribute)
+    if (hasShaderInputs && !hasAttributes) {
       return new GPUValidationError(
-        `Vertex shader has no vertex inputs (@location), but vertex state provides ${buffers.reduce((s, b) => s + (b?.attributes?.length ?? 0), 0)} attributes`
+        `Vertex shader has ${shaderInputLocations.size} input(s) at @location, but vertex state has no attributes`
       );
     }
 
-    // Extract location → type from shader struct declarations
-    // e.g. "@location(0) input0 : vec4<f32>," → {0: "vec4<f32>"}
-    const locationTypes = new Map<number, string>();
-    const locRegex = /@location\((\d+)\)\s+\w+\s*:\s*([^,{]+)/g;
-    let match;
-    while ((match = locRegex.exec(code)) !== null) {
-      locationTypes.set(parseInt(match[1]), match[2].trim());
+    if (!hasShaderInputs) {
+      // wgpu-native v29 panics at lib.rs:2223 when vertex attributes are provided but the
+      // vertex shader has no vertex inputs (@location). Return a validation error instead.
+      if (hasAttributes) {
+        return new GPUValidationError(
+          `Vertex shader has no vertex inputs (@location), but vertex state provides ${attributes.length} attributes`
+        );
+      }
+      return null;
+    }
+    if (!hasAttributes) return null;
+
+    // Build set of attribute locations for reverse check
+    const attributeLocations = new Set(attributes.map(a => a.shaderLocation));
+
+    // Check 1: every shader input location must have a matching buffer attribute
+    for (const [location] of shaderInputLocations) {
+      if (!attributeLocations.has(location)) {
+        return new GPUValidationError(
+          `Vertex shader input at @location(${location}) has no corresponding vertex buffer attribute`
+        );
+      }
     }
 
     // Base type → WGSL base type mapping for vertex formats
@@ -633,54 +691,43 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
       "unorm8x4-bgra": { base: "f32", componentCount: 4 },
     };
 
-    // Extract the WGSL base type and component count from a shader type string
-    function getShaderTypeInfo(wgslType: string): { base: string; count: number } | null {
-      const m = /(?:vec(\d+)<)?(\w+)/.exec(wgslType);
-      if (!m) return null;
-      if (m[1]) {
-        return { base: m[2], count: parseInt(m[1]) };
+    // Check 2: each attribute's format type must be compatible with shader input type
+    for (const attr of attributes) {
+      const shaderType = shaderInputLocations.get(attr.shaderLocation);
+      if (!shaderType) continue; // already checked above, but guard anyway
+
+      const fmtInfo = formatTypeInfo[attr.format];
+      if (!fmtInfo) continue;
+
+      // Extract WGSL base type from shader type string
+      function getShaderTypeInfo(wgslType: string): { base: string; count: number } | null {
+        const m = /(?:vec(\d+)<)?(\w+)/.exec(wgslType);
+        if (!m) return null;
+        if (m[1]) return { base: m[2], count: parseInt(m[1]) };
+        return { base: m[2], count: 1 };
       }
-      // Scalar type (f32, u32, i32)
-      return { base: m[2], count: 1 };
-    }
 
-    for (const b of buffers) {
-      if (!b?.attributes) continue;
-      for (const attr of b.attributes) {
-        const shaderType = locationTypes.get(attr.shaderLocation);
-        if (!shaderType) continue; // Can't validate without shader type
-        const fmtInfo = formatTypeInfo[attr.format];
-        if (!fmtInfo) continue;
+      const shaderInfo = getShaderTypeInfo(shaderType);
+      if (!shaderInfo) continue;
 
-        const shaderInfo = getShaderTypeInfo(shaderType);
-        if (!shaderInfo) continue;
+      if (shaderInfo.base !== fmtInfo.base) {
+        return new GPUValidationError(
+          `Vertex attribute at shaderLocation ${attr.shaderLocation} has format "${attr.format}" (base type ${fmtInfo.base}), but shader expects type "${shaderType}" (base type ${shaderInfo.base})`
+        );
+      }
 
-        // Check base type compatibility (sint→i32, uint→u32, float→f32)
-        if (shaderInfo.base !== fmtInfo.base) {
+      // Packed formats need exact component match and non-zero stride
+      const packedFormats = new Set(["unorm10-10-10-2", "unorm8x4-bgra"]);
+      if (packedFormats.has(attr.format)) {
+        if (shaderInfo.count !== fmtInfo.componentCount) {
           return new GPUValidationError(
-            `Vertex attribute at shaderLocation ${attr.shaderLocation} has format "${attr.format}" (base type ${fmtInfo.base}), but shader expects type "${shaderType}" (base type ${shaderInfo.base})`
+            `Packed vertex format "${attr.format}" (${fmtInfo.componentCount} components) requires shader type with exactly ${fmtInfo.componentCount} components, but shader expects "${shaderType}" (${shaderInfo.count} components)`
           );
         }
-
-        // Packed vertex formats (unorm10-10-10-2, unorm8x4-bgra) with stride=0 cause
-        // wgpu-native panic at lib.rs:2223 when the shader type component count doesn't
-        // exactly match the format's packed component count. Reject mismatched counts
-        // only for these packed formats (regular formats allow mismatched counts per spec).
-        const packedFormats = new Set(["unorm10-10-10-2", "unorm8x4-bgra"]);
-        if (packedFormats.has(attr.format)) {
-          // Packed formats require exact component count match
-          if (shaderInfo.count !== fmtInfo.componentCount) {
-            return new GPUValidationError(
-              `Packed vertex format "${attr.format}" (${fmtInfo.componentCount} components) requires shader type with exactly ${fmtInfo.componentCount} components, but shader expects "${shaderType}" (${shaderInfo.count} components)`
-            );
-          }
-          // Packed formats require arrayStride to match format size when stride > 0
-          // when stride is 0 wgpu-native may panic
-          if ((b as GPUVertexBufferLayout).arrayStride === 0) {
-            return new GPUValidationError(
-              `Packed vertex format "${attr.format}" requires non-zero arrayStride, but stride is 0`
-            );
-          }
+        if (attr.buffer.arrayStride === 0) {
+          return new GPUValidationError(
+            `Packed vertex format "${attr.format}" requires non-zero arrayStride, but stride is 0`
+          );
         }
       }
     }
@@ -1550,6 +1597,290 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
   }
 
   /**
+   * Parse a WGSL type string (e.g. "vec4<f32>", "f32", "vec2<u32>") to extract
+   * the base scalar type and component count.
+   */
+  private static parseWgslType(typeStr: string): { scalar: string; count: number } | null {
+    const m = /(?:vec(\d+)<)?\s*(\w+)\s*>?/.exec(typeStr);
+    if (!m) return null;
+    const scalar = m[2];
+    const count = m[1] ? parseInt(m[1]) : 1;
+    if (scalar !== "f32" && scalar !== "i32" && scalar !== "u32" && scalar !== "f16" && scalar !== "bool") return null;
+    return { scalar: scalar === "f16" ? "f32" : scalar, count };
+  }
+
+  /**
+   * Parse fragment shader OUTPUT @location(N) types from WGSL code.
+   * Fragment outputs can be:
+   *   1. A struct returned by the fragment function: `fn main() -> Outputs`
+   *      where `Outputs` has `@location(N)` fields.
+   *   2. A direct return type attribute: `fn main() -> @location(N) Type`.
+   *
+   * We must NOT match @location(N) in the fragment INPUT struct (function parameter).
+   */
+  private parseFragmentOutputLocations(code: string): Map<number, { type: string; scalar: string; count: number }> {
+    const outputs = new Map<number, { type: string; scalar: string; count: number }>();
+
+    // Case 1: direct return type attribute: fn main() -> @location(N) Type
+    // This is the simpler pattern used by some CTS tests.
+    const directRegex = /@fragment\s+fn\s+\w+\s*\([^)]*\)\s*->\s*@location\((\d+)\)\s+(\w[\w<>]+\w)/g;
+    let match;
+    while ((match = directRegex.exec(code)) !== null) {
+      const location = parseInt(match[1]);
+      const rawType = match[2].trim();
+      const info = GPUDeviceImpl.parseWgslType(rawType);
+      if (info) outputs.set(location, { type: rawType, ...info });
+    }
+
+    // Case 2: struct return type: fn main() -> StructName, find struct definition
+    const returnStructRegex = /@fragment\s+fn\s+\w+\s*\([^)]*\)\s*->\s*(\w+)/g;
+    let structMatch;
+    while ((structMatch = returnStructRegex.exec(code)) !== null) {
+      const structName = structMatch[1];
+      // Skip if this is a builtin type like vec4<f32>
+      if (structName.includes("<")) continue;
+
+      // Find the struct definition: struct StructName { ... }
+      const structRegex = new RegExp(`struct\\s+${structName}\\s*\\{([^}]*)\\}`);
+      const sMatch = code.match(structRegex);
+      if (!sMatch) continue;
+
+      const structBody = sMatch[1];
+      // Extract @location(N) fields from the struct body,
+      // handling extra attributes like @blend_src(N)
+      const locRegex = /@location\((\d+)\)\s+(?:@\w+(?:\([^)]*\))?\s+)*(\w+)\s*:\s*([^,;{}]+)/g;
+      let lm;
+      while ((lm = locRegex.exec(structBody)) !== null) {
+        const location = parseInt(lm[1]);
+        const rawType = lm[3].trim();
+        const info = GPUDeviceImpl.parseWgslType(rawType);
+        if (info) outputs.set(location, { type: rawType, ...info });
+      }
+    }
+
+    return outputs;
+  }
+
+  /**
+   * Validate that fragment shader outputs are compatible with color target formats.
+   *
+   * Per WebGPU spec:
+   * - The fragment shader output's scalar type (f32, u32, i32) must match the color
+   *   target format's sample type (float->f32, uint->u32, sint->i32).
+   * - The fragment output's component count must be >= the format's channel count.
+   * - If a color target has no corresponding fragment output at its location,
+   *   its writeMask must be 0.
+   */
+  private validateFragmentOutputs(
+    fragment: GPUFragmentState | undefined,
+  ): GPUValidationError | null {
+    if (!fragment) return null;
+    const mod = fragment.module as unknown as { code?: string };
+    if (!mod?.code) return null;
+    const code = mod.code;
+
+    const targets = fragment.targets ? Array.from(fragment.targets) : [];
+    if (targets.length === 0) return null;
+
+    // Parse only fragment OUTPUT locations (not inputs)
+    const shaderOutputs = this.parseFragmentOutputLocations(code);
+
+    // If shader has @location( but we parsed nothing, skip validation
+    // (e.g. function return type outputs we cannot handle).
+    if (shaderOutputs.size === 0 && code.includes("@location(")) return null;
+
+    // Channel count per color-renderable format
+    const formatChannels: Record<string, number> = {
+      "r8unorm": 1, "r8snorm": 1, "r8uint": 1, "r8sint": 1,
+      "r16uint": 1, "r16sint": 1, "r16float": 1,
+      "rg8unorm": 2, "rg8snorm": 2, "rg8uint": 2, "rg8sint": 2,
+      "r32uint": 1, "r32sint": 1, "r32float": 1,
+      "rg16uint": 2, "rg16sint": 2, "rg16float": 2,
+      "rgba8unorm": 4, "rgba8unorm-srgb": 4, "rgba8snorm": 4,
+      "rgba8uint": 4, "rgba8sint": 4,
+      "bgra8unorm": 4, "bgra8unorm-srgb": 4,
+      "rgb10a2unorm": 4,
+      "rg11b10ufloat": 3,
+      "rgb9e5ufloat": 3,
+      "rg32uint": 2, "rg32sint": 2, "rg32float": 2,
+      "rgba16uint": 4, "rgba16sint": 4, "rgba16float": 4,
+      "rgba32uint": 4, "rgba32sint": 4, "rgba32float": 4,
+    };
+    // Format -> color type (float, uint, sint)
+    const formatColorTypes: Record<string, string> = {
+      "r8unorm": "float", "r8snorm": "float", "r16float": "float",
+      "rg8unorm": "float", "rg8snorm": "float", "r32float": "float",
+      "rg16float": "float",
+      "rgba8unorm": "float", "rgba8unorm-srgb": "float", "rgba8snorm": "float",
+      "bgra8unorm": "float", "bgra8unorm-srgb": "float",
+      "rgb10a2unorm": "float", "rgb9e5ufloat": "float", "rg11b10ufloat": "float",
+      "rg32float": "float", "rgba16float": "float", "rgba32float": "float",
+      "r8uint": "uint", "r16uint": "uint", "rg8uint": "uint",
+      "r32uint": "uint", "rg16uint": "uint",
+      "rgba8uint": "uint", "rg32uint": "uint",
+      "rgba16uint": "uint", "rgba32uint": "uint",
+      "r8sint": "sint", "r16sint": "sint", "rg8sint": "sint",
+      "r32sint": "sint", "rg16sint": "sint",
+      "rgba8sint": "sint", "rg32sint": "sint",
+      "rgba16sint": "sint", "rgba32sint": "sint",
+    };
+    const colorTypeToScalar: Record<string, string> = { float: "f32", uint: "u32", sint: "i32" };
+
+    for (let i = 0; i < targets.length; i++) {
+      const target = targets[i];
+      if (!target) continue;
+      const fmt = target.format;
+      const channels = formatChannels[fmt];
+      const colorType = formatColorTypes[fmt];
+      if (channels === undefined || colorType === undefined) continue; // skip unknown formats
+
+      const expectedScalar = colorTypeToScalar[colorType];
+      const shaderOutput = shaderOutputs.get(i);
+
+      if (shaderOutput) {
+        if (shaderOutput.scalar !== expectedScalar) {
+          return new GPUValidationError(
+            `Color target[${i}] format "${fmt}" expects ${expectedScalar} output, but fragment shader outputs "${shaderOutput.type}" at @location(${i})`
+          );
+        }
+        if (shaderOutput.count < channels) {
+          return new GPUValidationError(
+            `Color target[${i}] format "${fmt}" has ${channels} channels, but fragment shader provides only ${shaderOutput.count} component(s) at @location(${i})`
+          );
+        }
+        // Blend-specific: when a COLOR blend factor reads alpha, output must be vec4
+        const blend = target.blend;
+        if (blend) {
+          const colorSrc = blend.color?.srcFactor ?? "one";
+          const colorDst = blend.color?.dstFactor ?? "zero";
+          const colorReadsAlpha = colorSrc.includes("src-alpha") || colorDst.includes("src-alpha");
+          if (colorReadsAlpha && shaderOutput.count !== 4) {
+            return new GPUValidationError(
+              `Color target[${i}] uses a color blend factor that reads alpha ("${colorSrc}" / "${colorDst}"), but fragment shader output "${shaderOutput.type}" at @location(${i}) has only ${shaderOutput.count} component(s). Must be vec4 when color blend reads alpha.`
+            );
+          }
+        }
+      } else {
+        // No fragment output for this target -> writeMask must be 0
+        // We can confidently say there's no output when:
+        //   1) shaderOutputs has entries but not at this location (struct pattern), OR
+        //   2) shaderOutputs is empty AND shader has no @location at all (truly no outputs)
+        const genuinelyNoOutput = shaderOutputs.size > 0 || !code.includes("@location(");
+        if (genuinelyNoOutput) {
+          const wm = target.writeMask ?? 0xF;
+          if (wm !== 0) {
+            return new GPUValidationError(
+              `Color target[${i}] format "${fmt}" has no corresponding fragment shader output, but writeMask is ${wm} (must be 0)`
+            );
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Extract @location(N) types from a struct body, handling extra attributes
+   * like @interpolate(...) between @location(N) and the variable name.
+   * Pattern: @location(N) [extra attrs] varName : Type,
+   */
+  private parseLocationTypesFromStructBody(structBody: string): Map<number, string> {
+    const result = new Map<number, string>();
+    // Match @location(N), skip any extra @attribute(...) tokens, then match varName : Type
+    const locRegex = /@location\((\d+)\)\s+(?:@\w+(?:\([^)]*\))?\s+)*(\w+)\s*:\s*(\w[\w<>]*)/g;
+    let m;
+    while ((m = locRegex.exec(structBody)) !== null) {
+      result.set(parseInt(m[1]), m[3].trim());
+    }
+    return result;
+  }
+
+  /**
+   * Parse vertex shader OUTPUT @location(N) types from WGSL.
+   * Vertex outputs are in the return struct of the vertex function.
+   * Pattern: fn main() -> StructName { ... }
+   * where StructName has @location(N) fields.
+   */
+  private parseVertexOutputLocations(code: string): Map<number, string> {
+    const outputs = new Map<number, string>();
+
+    // Find return struct name: @vertex fn main() -> StructName
+    const fnMatch = code.match(/@vertex\s+fn\s+\w+\s*\([^)]*\)\s*->\s*(\w+)/);
+    if (!fnMatch) return outputs;
+
+    const structName = fnMatch[1];
+    if (structName.includes("<")) return outputs; // builtin type, not a struct
+
+    // Find struct definition
+    const structRegex = new RegExp(`struct\\s+${structName}\\s*\\{([^}]*)\\}`);
+    const structMatch = code.match(structRegex);
+    if (!structMatch) return outputs;
+
+    return this.parseLocationTypesFromStructBody(structMatch[1]);
+  }
+
+  /**
+   * Parse fragment shader INPUT @location(N) types from WGSL.
+   * Fragment inputs are in the parameter struct of the fragment function.
+   * Pattern: fn main(input: StructName) { ... }
+   */
+  private parseFragmentInputLocations(code: string): Map<number, string> {
+    const inputs = new Map<number, string>();
+
+    // Find parameter struct name: @fragment fn main(paramName: StructName)
+    const fnMatch = code.match(/@fragment\s+fn\s+\w+\s*\(\s*\w+\s*:\s*(\w+)\s*\)/);
+    if (!fnMatch) return inputs;
+
+    const structName = fnMatch[1];
+
+    // Find struct definition
+    const structRegex = new RegExp(`struct\\s+${structName}\\s*\\{([^}]*)\\}`);
+    const structMatch = code.match(structRegex);
+    if (!structMatch) return inputs;
+
+    return this.parseLocationTypesFromStructBody(structMatch[1]);
+  }
+
+  /**
+   * Validate inter-stage interface matching between vertex and fragment shaders.
+   *
+   * Rules:
+   * - Every fragment input @location(N) must have a corresponding vertex output at the same location
+   * - The types must match exactly
+   * - Vertex outputs can be a superset of fragment inputs (extra outputs are allowed)
+   */
+  private validateInterStage(descriptor: GPURenderPipelineDescriptor): GPUValidationError | null {
+    const vertexModule = descriptor.vertex.module as unknown as { code?: string };
+    if (!vertexModule?.code) return null;
+
+    const fragModule = descriptor.fragment?.module as unknown as { code?: string };
+    if (!fragModule?.code) return null;
+
+    const vertexOutputs = this.parseVertexOutputLocations(vertexModule.code);
+    const fragmentInputs = this.parseFragmentInputLocations(fragModule.code);
+
+    if (fragmentInputs.size === 0) return null; // no fragment inputs to validate
+
+    // Every fragment input must have a matching vertex output at the same location
+    for (const [location, fragType] of fragmentInputs) {
+      const vertType = vertexOutputs.get(location);
+      if (vertType === undefined) {
+        return new GPUValidationError(
+          `Fragment shader input at @location(${location}) has type "${fragType}", but vertex shader has no output at that location`
+        );
+      }
+      // Types must match exactly (no implicit conversion)
+      if (vertType !== fragType) {
+        return new GPUValidationError(
+          `Type mismatch at @location(${location}): vertex outputs "${vertType}" but fragment expects "${fragType}"`
+        );
+      }
+    }
+
+    return null;
+  }
+
+  /**
    * Check for NaN, Infinity, and -Infinity in pipeline overridable constant values.
    * Per WebGPU spec, these must throw TypeError (not GPUValidationError).
    */
@@ -1580,31 +1911,96 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
   }
 
   /**
-   * Validate that pipeline overridable constant values are valid for their
-   * declared WGSL types. Returns a GPUValidationError if any value is out of range.
+   * Parse override declarations from WGSL with unicode-aware identifier matching.
+   * The wgsl-module-loader's parseOverrides uses \w (ASCII-only) so unicode
+   * identifiers like "数" are missed. This method provides a fallback.
+   */
+  private parseWgslOverrides(code: string): Array<{ name: string; type: string; id?: number; hasDefault: boolean }> {
+    // Unicode-aware identifier: start with letter/underscore/unicode, continue with +digits
+    const ident = /[a-zA-Z_\u00c0-\uffff][a-zA-Z0-9_\u00c0-\uffff]*/;
+    const regex = new RegExp(`(?:@id\\((\\d+)\\)\\s+)?override\\s+(${ident.source})\\s*:\\s*(${ident.source})(?:\\s*=\\s*([^;]+))?;`, 'g');
+    const result: Array<{ name: string; type: string; id?: number; hasDefault: boolean }> = [];
+    let m;
+    while ((m = regex.exec(code)) !== null) {
+      result.push({
+        id: m[1] ? parseInt(m[1]) : undefined,
+        name: m[2],
+        type: m[3],
+        hasDefault: m[4] !== undefined,
+      });
+    }
+    // If the unicode regex found nothing, fall back to the library parser
+    if (result.length === 0) {
+      return parseOverrides(code);
+    }
+    return result;
+  }
+
+  /**
+   * Validate pipeline overridable constants against the WGSL declarations.
    *
    * Checks:
-   * - u32 values must be integers in [0, 4294967295]
-   * - i32 values must be integers in [-2147483648, 2147483647]
-   * - f32 values must be exactly representable as f32 (Math.fround(v) === v)
+   * 1. **Identifier**: Every constant name must match either an override name or an @id(N) value
+   *    (as numeric string key). Null character in name is an error.
+   * 2. **Uninitialized**: Every override without a default value must have an entry in constants.
+   * 3. **Value ranges**: u32/i32/f32/f16 values must be in range (existing checks).
    */
   private validateOverrides(
     constants: Record<string, number> | undefined,
     shaderModule: GPUShaderModule,
   ): GPUValidationError | null {
-    if (!constants || Object.keys(constants).length === 0) return null;
     const mod = shaderModule as unknown as { code?: string };
     if (!mod?.code) return null;
 
-    const overrideTypes = this.parseOverrideTypes(mod.code);
+    // Parse overrides. Falls back to a unicode-aware regex for identifiers
+    // (parseOverrides uses \w which doesn't match Unicode like "数").
+    const overrides = this.parseWgslOverrides(mod.code);
+    if (overrides.length === 0) return null;
 
-    for (const [name, value] of Object.entries(constants)) {
-      // NaN/Infinity is already checked in checkConstantTypeErrors (throws TypeError),
-      // but guard here too for safety.
+    // Build valid constant keys:
+    // Per WebGPU spec, an override with @id(N) is addressed by the numeric id,
+    // NOT by its WGSL name. Without @id, the WGSL name is the lookup key.
+    const validKeys = new Map<string, string>();
+    for (const ov of overrides) {
+      if (ov.id !== undefined) {
+        validKeys.set(String(ov.id), ov.type);
+      } else {
+        validKeys.set(ov.name, ov.type);
+      }
+    }
+
+    // All overrides without defaults must have a constant entry
+    for (const ov of overrides) {
+      if (ov.hasDefault) continue;
+      const key = ov.id !== undefined ? String(ov.id) : ov.name;
+      const provided = constants !== undefined && key in constants;
+      if (!provided) {
+        return new GPUValidationError(
+          `Pipeline constant for override "${ov.name}"${ov.id !== undefined ? ` (@id(${ov.id}))` : ""} must be provided (no default value)`
+        );
+      }
+    }
+
+    // No constants to check further
+    if (!constants) return null;
+
+    // Every constant name must be a valid key
+    for (const name of Object.keys(constants)) {
+      if (name.includes("\0")) {
+        return new GPUValidationError(
+          `Pipeline constant name "${name.replace("\0", "\\0")}" contains null character (U+0000)`
+        );
+      }
+      const type = validKeys.get(name);
+      if (!type) {
+        return new GPUValidationError(
+          `Pipeline constant "${name}" does not match any override name or @id value in the shader`
+        );
+      }
+
+      // Value range validation
+      const value = constants[name];
       if (typeof value !== "number") continue;
-
-      const type = overrideTypes.get(name);
-      if (!type) continue; // Unknown override name — let native handle it
 
       if (type === "u32") {
         if (!Number.isInteger(value) || value < 0 || value > 4294967295) {
@@ -1619,43 +2015,20 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
           );
         }
       } else if (type === "f32") {
-        // f32 value must be exactly representable (no rounding on f64→f32 conversion)
         if (Math.fround(value) !== value) {
           return new GPUValidationError(
             `Pipeline constant "${name}" value ${value} is not exactly representable as f32`
           );
         }
-      } else if (type === "f16" || type === "f16") {
-        // f16 representability: check finite, within range of f16
+      } else if (type === "f16") {
         if (!Number.isFinite(value)) continue;
-        if (Math.abs(value) > 65504) {
+        const f16Limit = 65504;
+        if (Math.abs(value) > f16Limit) {
           return new GPUValidationError(
             `Pipeline constant "${name}" value ${value} is out of range for type f16 (expected -65504 to 65504)`
           );
         }
-        // Check that value can be exactly represented in f16.
-        // f16 has 10 mantissa bits — we approximate by checking if rounding through f32
-        // produces the same value (sufficient for the CTS boundary tests).
-        const f32Rounded = Math.fround(value);
-        // Convert through f32 → f16 → f32 path to check representability
-        const f16UpperLimit = 65504;
-        const f16MinNormal = 0.00006103515625; // 2^-14
-        if (Math.abs(value) < f16MinNormal && value !== 0) {
-          // Subnormals are representable down to ~5.96e-8
-          // For simplicity, check via rounding
-        }
-        // Simplest check: a value is representable in f16 if it's an integer within
-        // the exact range or if Math.fround(value) approximates it closely.
-        // The CTS uses boundary values that are ±1 ULP from the first non-representable value.
-        // We approximate by checking if the value's absolute magnitude is ≤ 65504
-        // and it's not a very large integer beyond f16 mantissa precision.
-        if (value > f16UpperLimit || value < -f16UpperLimit) {
-          return new GPUValidationError(
-            `Pipeline constant "${name}" value ${value} is out of range for type f16`
-          );
-        }
       }
-      // bool: any value is valid (conversion to bool never fails per spec)
     }
 
     return null;
@@ -1752,10 +2125,26 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
       return new GPURenderPipelineImpl(0 as Pointer, descriptor.label) as unknown as GPURenderPipeline;
     }
 
+    // Validate inter-stage interface (vertex outputs match fragment inputs)
+    const interStageErr = this.validateInterStage(descriptor);
+    if (interStageErr) {
+      this.captureError(interStageErr);
+      const { GPURenderPipelineImpl } = require("./pipeline");
+      return new GPURenderPipelineImpl(0 as Pointer, descriptor.label) as unknown as GPURenderPipeline;
+    }
+
     // Validate fragment state (color target formats, count, etc.)
     const fragStateErr = this.validateFragmentState(descriptor.fragment, !!descriptor.depthStencil);
     if (fragStateErr) {
       this.captureError(fragStateErr);
+      const { GPURenderPipelineImpl } = require("./pipeline");
+      return new GPURenderPipelineImpl(0 as Pointer, descriptor.label) as unknown as GPURenderPipeline;
+    }
+
+    // Validate fragment shader outputs vs color target formats
+    const fragOutputErr = this.validateFragmentOutputs(descriptor.fragment);
+    if (fragOutputErr) {
+      this.captureError(fragOutputErr);
       const { GPURenderPipelineImpl } = require("./pipeline");
       return new GPURenderPipelineImpl(0 as Pointer, descriptor.label) as unknown as GPURenderPipeline;
     }
@@ -2274,9 +2663,15 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     // Validate vertex shader inputs vs vertex buffer attributes
     const shaderCompatErr = this.validateVertexShaderCompatibility(descriptor.vertex);
     if (shaderCompatErr) return Promise.reject(new GPUPipelineError(shaderCompatErr.message, { reason: "validation" }));
+    // Validate inter-stage interface (vertex outputs match fragment inputs)
+    const interStageErr = this.validateInterStage(descriptor);
+    if (interStageErr) return Promise.reject(new GPUPipelineError(interStageErr.message, { reason: "validation" }));
     // Validate fragment state (color target formats, count, etc.)
     const fragStateErr = this.validateFragmentState(descriptor.fragment, !!descriptor.depthStencil);
     if (fragStateErr) return Promise.reject(new GPUPipelineError(fragStateErr.message, { reason: "validation" }));
+    // Validate fragment shader outputs vs color target formats
+    const fragOutputErr = this.validateFragmentOutputs(descriptor.fragment);
+    if (fragOutputErr) return Promise.reject(new GPUPipelineError(fragOutputErr.message, { reason: "validation" }));
     // Validate primitive state
     const primErr = this.validatePrimitiveState(descriptor.primitive);
     if (primErr) return Promise.reject(new GPUPipelineError(primErr.message, { reason: "validation" }));
