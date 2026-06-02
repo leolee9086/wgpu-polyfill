@@ -7,4 +7,5 @@
  */
 
 export type { EntryPointInfo } from "wgsl-module-loader/parser";
-export { parseEntryPoints, detectImmediateSize, utils } from "wgsl-module-loader/parser";
+export type { LocationInfo, OverrideInfo, BindingInfo } from "wgsl-module-loader/parser";
+export { parseEntryPoints, detectImmediateSize, utils, parseLocations, parseOverrides, parseBindings, parseStorageTextureInfo } from "wgsl-module-loader/parser";
