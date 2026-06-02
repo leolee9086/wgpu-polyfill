@@ -11,10 +11,13 @@ export class GPUPipelineLayoutImpl extends GPUObjectBase implements GPUPipelineL
   readonly __brand = "GPUPipelineLayout";
   /** The immediate data size configured for this layout (0 if none). */
   readonly immediateSize: number;
+  /** The device pointer that created this layout (for cross-device validation). */
+  readonly devicePtr: Pointer;
 
-  constructor(handle: Pointer, label?: string, immediateSize = 0) {
+  constructor(handle: Pointer, label?: string, immediateSize = 0, devicePtr: Pointer = 0 as Pointer) {
     super(handle, label);
     this.immediateSize = immediateSize;
+    this.devicePtr = devicePtr;
   }
 
   protected releaseImpl(): void {
