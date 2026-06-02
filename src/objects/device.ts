@@ -495,17 +495,16 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
 
     const bufArr = buffers ? Array.from(buffers) : [];
 
-    // wgpu-native v29 does NOT support unused vertex buffer slots (holes in the array).
-    // All slots must be explicitly provided, even if empty.
+    // wgpu-native v29 panics on unused vertex buffer slots (holes). Reject them.
     for (let i = 0; i < bufArr.length; i++) {
       if (!bufArr[i]) {
         return new GPUValidationError(
-          `Vertex buffer slot ${i} is unused (null/undefined). wgpu-native does not support holes in the vertex buffer array. Use a buffer with attributes:[] instead.`
+          `Vertex buffer slot ${i} is unused (null/undefined). wgpu-native v29 does not support holes.`
         );
       }
     }
 
-    // Buffer count
+    // Buffer count and validate non-null entries
     let nonNullCount = 0;
     for (const b of bufArr) {
       if (b) {
@@ -650,8 +649,8 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     }
 
     if (!hasShaderInputs) {
-      // wgpu-native v29 panics at lib.rs:2223 when vertex attributes are provided but the
-      // vertex shader has no vertex inputs (@location). Return a validation error instead.
+      // wgpu-native v29 panics at lib.rs:2223 when vertex attributes are provided
+      // but the vertex shader has no @location inputs. Return a validation error.
       if (hasAttributes) {
         return new GPUValidationError(
           `Vertex shader has no vertex inputs (@location), but vertex state provides ${attributes.length} attributes`
@@ -716,19 +715,13 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
         );
       }
 
-      // Packed formats need exact component match and non-zero stride
+      // Packed formats (unorm10-10-10-2, unorm8x4-bgra) are not fully supported
+      // in wgpu-native v29 — they can cause panics at lib.rs:2223. Reject them.
       const packedFormats = new Set(["unorm10-10-10-2", "unorm8x4-bgra"]);
       if (packedFormats.has(attr.format)) {
-        if (shaderInfo.count !== fmtInfo.componentCount) {
-          return new GPUValidationError(
-            `Packed vertex format "${attr.format}" (${fmtInfo.componentCount} components) requires shader type with exactly ${fmtInfo.componentCount} components, but shader expects "${shaderType}" (${shaderInfo.count} components)`
-          );
-        }
-        if (attr.buffer.arrayStride === 0) {
-          return new GPUValidationError(
-            `Packed vertex format "${attr.format}" requires non-zero arrayStride, but stride is 0`
-          );
-        }
+        return new GPUValidationError(
+          `Packed vertex format "${attr.format}" is not supported by this device`
+        );
       }
     }
 
