@@ -359,7 +359,12 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
       // Undefined entry point — must default to the only entry point for this stage
       if (shaderModule && stage) {
         const mod = shaderModule as unknown as { entryPoints?: Array<{ name: string; stage: string }> };
-        if (mod.entryPoints && mod.entryPoints.length > 0) {
+        if (mod.entryPoints) {
+          if (mod.entryPoints.length === 0) {
+            return new GPUValidationError(
+              `Shader module has no entry points for stage "${stage}"`
+            );
+          }
           const stageEntries = mod.entryPoints.filter(e => e.stage === stage);
           // No entry point for this stage, but shader has entry points for other stages → error
           if (stageEntries.length === 0) {
@@ -386,7 +391,13 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     // Check against shader module entry points
     if (shaderModule && stage) {
       const mod = shaderModule as unknown as { entryPoints?: Array<{ name: string; stage: string }> };
-      if (mod.entryPoints && mod.entryPoints.length > 0) {
+      if (mod.entryPoints) {
+        // If entryPoints is empty, the shader module has no valid entry points — reject
+        if (mod.entryPoints.length === 0) {
+          return new GPUValidationError(
+            `Shader module has no entry points for stage "${stage}"`
+          );
+        }
         const exists = mod.entryPoints.some(e => e.name === entryPoint && e.stage === stage);
         if (!exists) {
           return new GPUValidationError(
@@ -915,6 +926,61 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     return null;
   }
 
+  /**
+   * Validate blend state compatibility with device features.
+   * - Float32 blendable: blending on r32float/rg32float/rgba32float requires float32-blendable feature
+   */
+  private validateBlendState(fragment: GPUFragmentState | undefined): GPUValidationError | null {
+    if (!fragment?.targets) return null;
+
+    const float32Formats = new Set(["r32float", "rg32float", "rgba32float"]);
+    const hasBlendableFeature = this._features?.has?.("float32-blendable") ?? false;
+    if (hasBlendableFeature) return null;
+
+    for (const target of fragment.targets) {
+      if (target && target.blend && float32Formats.has(target.format)) {
+        return new GPUValidationError(
+          `Blending on ${target.format} requires the float32-blendable feature`
+        );
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Validate that all shader modules used in the pipeline are from the same device
+   * and are not error/invalid modules.
+   */
+  private validateShaderModules(descriptor: GPURenderPipelineDescriptor): GPUValidationError | null {
+    // Check vertex module
+    const vertexModule = descriptor.vertex.module as unknown as { devicePtr?: Pointer; isError?: boolean } | undefined;
+    if (!vertexModule) {
+      return new GPUValidationError(`Vertex shader module is required`);
+    }
+    if (vertexModule.isError) {
+      return new GPUValidationError(`Vertex shader module is invalid`);
+    }
+    if (vertexModule.devicePtr !== undefined && vertexModule.devicePtr !== this._handle) {
+      return new GPUValidationError(`Vertex shader module was created from a different device`);
+    }
+
+    // Check fragment module
+    if (descriptor.fragment) {
+      const fragModule = descriptor.fragment.module as unknown as { devicePtr?: Pointer; isError?: boolean } | undefined;
+      if (!fragModule) {
+        return new GPUValidationError(`Fragment shader module is required`);
+      }
+      if (fragModule.isError) {
+        return new GPUValidationError(`Fragment shader module is invalid`);
+      }
+      if (fragModule.devicePtr !== undefined && fragModule.devicePtr !== this._handle) {
+        return new GPUValidationError(`Fragment shader module was created from a different device`);
+      }
+    }
+
+    return null;
+  }
+
   createTexture(descriptor: GPUTextureDescriptor): GPUTexture {
     // Heuristic: estimated bytes per pixel by format
     const formatByteSizes: Record<string, number> = {
@@ -1365,12 +1431,18 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
 
     const moduleHandle = getLib().wgpuDeviceCreateShaderModule(this._handle, descPtr);
 
+    // Check if shader module creation failed (invalid WGSL code)
+    const isErrorModule = !moduleHandle;
+
     if (!moduleHandle) {
-      throw new Error("Failed to create shader module");
+      // Return an error shader module instead of throwing (CTS tests create invalid modules
+      // and then use them in render pipelines, expecting validation errors).
+      const { GPUShaderModuleImpl } = require("./shader-module");
+      return new GPUShaderModuleImpl(0 as Pointer, this._instance, this._handle, descriptor.label, [], 0, false, code, false, true) as unknown as GPUShaderModule;
     }
 
     const { GPUShaderModuleImpl } = require("./shader-module");
-    return new GPUShaderModuleImpl(moduleHandle, this._instance, descriptor.label, entryPoints, immediateDataSize, hasFragDepth, code, hasSampleMask) as unknown as GPUShaderModule;
+    return new GPUShaderModuleImpl(moduleHandle, this._instance, this._handle, descriptor.label, entryPoints, immediateDataSize, hasFragDepth, code, hasSampleMask, false) as unknown as GPUShaderModule;
   }
 
   createComputePipeline(descriptor: GPUComputePipelineDescriptor): GPUComputePipeline {
@@ -1475,6 +1547,14 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
       ? 0
       : ((descriptor.layout as unknown as { handle: Pointer })?.handle as unknown as number) ?? 0;
 
+    // Validate shader modules (device mismatch, error state)
+    const shaderModuleErr = this.validateShaderModules(descriptor);
+    if (shaderModuleErr) {
+      this.captureError(shaderModuleErr);
+      const { GPURenderPipelineImpl } = require("./pipeline");
+      return new GPURenderPipelineImpl(0 as Pointer, descriptor.label) as unknown as GPURenderPipeline;
+    }
+
     // Validate entry points before calling native
     const vertexEntryPointError = this.validateEntryPoint(descriptor.vertex.entryPoint, descriptor.vertex.module, "vertex");
     if (vertexEntryPointError) {
@@ -1537,6 +1617,14 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     const msErr = this.validateMultisampleState(descriptor.multisample, descriptor.fragment?.module as unknown as { hasSampleMask?: boolean } | undefined);
     if (msErr) {
       this.captureError(msErr);
+      const { GPURenderPipelineImpl } = require("./pipeline");
+      return new GPURenderPipelineImpl(0 as Pointer, descriptor.label) as unknown as GPURenderPipeline;
+    }
+
+    // Validate blend state vs device features
+    const blendErr = this.validateBlendState(descriptor.fragment);
+    if (blendErr) {
+      this.captureError(blendErr);
       const { GPURenderPipelineImpl } = require("./pipeline");
       return new GPURenderPipelineImpl(0 as Pointer, descriptor.label) as unknown as GPURenderPipeline;
     }
@@ -1975,6 +2063,9 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
       ? this.validateEntryPoint(descriptor.fragment.entryPoint, descriptor.fragment.module, "fragment")
       : null;
     if (fragmentEntryPointError) return Promise.reject(new GPUPipelineError(fragmentEntryPointError.message, { reason: "validation" }));
+    // Validate shader modules (device mismatch, error state)
+    const shaderModuleErr = this.validateShaderModules(descriptor);
+    if (shaderModuleErr) return Promise.reject(new GPUPipelineError(shaderModuleErr.message, { reason: "validation" }));
     // Validate immediate data size for vertex and fragment shaders
     if (descriptor.vertex.module) {
       const immErr = this.validateImmediateSize(descriptor.vertex.module, descriptor.layout);
@@ -2007,6 +2098,9 @@ export class GPUDeviceImpl extends GPUObjectBase implements GPUDevice {
     // Validate multisample state
     const msErr = this.validateMultisampleState(descriptor.multisample, descriptor.fragment?.module as unknown as { hasSampleMask?: boolean } | undefined);
     if (msErr) return Promise.reject(new GPUPipelineError(msErr.message, { reason: "validation" }));
+    // Validate blend state vs device features
+    const blendErr = this.validateBlendState(descriptor.fragment);
+    if (blendErr) return Promise.reject(new GPUPipelineError(blendErr.message, { reason: "validation" }));
     // For render pipeline async, we use the sync version wrapped in a microtask
     // since the full async implementation would require duplicating all the
     // complex descriptor encoding. This still provides the async API contract.

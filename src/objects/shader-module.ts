@@ -11,6 +11,8 @@ import { parseEntryPoints } from "../wgsl/parser";
 export class GPUShaderModuleImpl extends GPUObjectBase implements GPUShaderModule {
   readonly __brand = "GPUShaderModule";
   private _instance: Pointer;
+  /** The device that created this shader module (for cross-device validation). */
+  readonly devicePtr: Pointer;
   /** Entry points parsed from WGSL source, used for entry point validation. */
   readonly entryPoints: EntryPointInfo[];
   /** Immediate data size in bytes (0 if not using var<immediate>). */
@@ -21,15 +23,19 @@ export class GPUShaderModuleImpl extends GPUObjectBase implements GPUShaderModul
   readonly hasSampleMask: boolean;
   /** The original WGSL source code (used for vertex/fragment input validation). */
   readonly code: string;
+  /** True if this is an error/invalid shader module. */
+  readonly isError: boolean;
 
-  constructor(handle: Pointer, instance: Pointer, label?: string, entryPoints?: EntryPointInfo[], immediateDataSize = 0, hasFragDepth = false, code = "", hasSampleMask = false) {
+  constructor(handle: Pointer, instance: Pointer, devicePtr: Pointer, label?: string, entryPoints?: EntryPointInfo[], immediateDataSize = 0, hasFragDepth = false, code = "", hasSampleMask = false, isError = false) {
     super(handle, label);
     this._instance = instance;
+    this.devicePtr = devicePtr;
     this.entryPoints = entryPoints ?? [];
     this.immediateDataSize = immediateDataSize;
     this.hasFragDepth = hasFragDepth;
     this.hasSampleMask = hasSampleMask;
     this.code = code;
+    this.isError = isError;
   }
 
   protected releaseImpl(): void {
